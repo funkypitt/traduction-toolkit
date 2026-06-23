@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <title>Traduction</title>
+  <link rel="stylesheet" href="side_panel.css">
+</head>
+<body>
+  <header>
+    <h1>Traduction</h1>
+    <span id="daemon-status" class="pill pill-unknown" title="état du daemon local">daemon ?</span>
+  </header>
+
+  <label>
+    <span>URL de la vidéo</span>
+    <input id="url" type="text" placeholder="https://www.youtube.com/watch?v=…">
+  </label>
+
+  <label>
+    <span>Script</span>
+    <select id="script"></select>
+  </label>
+
+  <label>
+    <span>Paramètres</span>
+    <input id="args" type="text" value="-s en -t fr" spellcheck="false">
+  </label>
+
+  <div class="buttons">
+    <button id="go" class="primary">Télécharger et lancer</button>
+    <button id="cancel" class="danger" hidden>Annuler</button>
+  </div>
+
+  <section id="voicemap" class="voicemap" hidden>
+    <div class="voicemap-head">
+      <span class="voicemap-title">🎚️ Apparier les voix</span>
+      <span class="voicemap-sub">Écoutez chaque locuteur détecté, choisissez une voix.</span>
+    </div>
+    <div id="voicemap-speakers"></div>
+    <button id="voicemap-confirm" class="primary">Confirmer l'appariement</button>
+  </section>
+
+  <section class="status" hidden>
+    <div class="status-line">
+      <span id="state" class="state">—</span>
+      <span id="file" class="file"></span>
+    </div>
+    <pre id="log"></pre>
+  </section>
+
+  <footer>
+    <span id="hint">Daemon local : <code>127.0.0.1:47318</code></span>
+  </footer>
+
+  <script src="side_panel.js"></script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Traduction",
+  "version": "0.2.0",
+  "description": "Télécharge une vidéo YouTube/X et lance un script de traduction/doublage local (via le daemon Traduction).",
+  "action": {
+    "default_title": "Traduction"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "side_panel.html"
+  },
+  "permissions": ["activeTab", "tabs", "storage", "sidePanel"],
+  "host_permissions": [
+    "http://127.0.0.1:47318/*"
+  ],
+  "icons": {
+    "16": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  }
+}

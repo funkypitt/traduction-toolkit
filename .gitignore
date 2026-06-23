@@ -43,3 +43,5 @@ clipper_api_setup.txt
 *token*.txt
 # Exception : l'icône bundlée du .deb (malgré l'ignore *.png plus haut)
 !packaging/icon.png
+# Exception : l'icône de l'extension Chrome
+!chrome-extension/extension/icon.png

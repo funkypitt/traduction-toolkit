@@ -4,7 +4,7 @@ Scripts Python indépendants pour **traduire, sous-titrer, doubler, résumer** e
 
 > 🆕 **LLM local par défaut.** Depuis 2026-06, les scripts utilisent un modèle local (Ollama) par défaut — aucune clé API requise. Ajoutez `--llm claude` pour utiliser l'API Anthropic. Voir [LLM : local ou Claude](#llm--local-ollama-ou-claude).
 >
-> 🖥️ Une **interface graphique** (`gui.py`) et un **paquet `.deb`** permettent de tout piloter sans ligne de commande. Voir [Interface graphique](#interface-graphique-gui).
+> 🖥️ Une **interface graphique** (`gui.py`), un **paquet `.deb`** et une **extension de navigateur** (Chrome/Brave/Edge) permettent de tout piloter sans ligne de commande. Voir [Interface graphique](#interface-graphique-gui) et [Extension Chrome](#extension-chrome-panneau-navigateur).
 
 ## Installation rapide (Ubuntu / Pop!_OS, GPU NVIDIA)
 
@@ -181,6 +181,26 @@ Il liste tous les scripts, propose des formulaires (champs, listes déroulantes,
 sudo apt install ./dist/traduction-gui_*.deb
 # puis cherchez « Traduction » dans le menu, ou lancez : traduction-gui
 ```
+
+## Extension Chrome (panneau navigateur)
+
+Une **extension de navigateur** (Chrome / Brave / Edge / Chromium) lance le toolkit **directement depuis une vidéo YouTube/X**, sans ligne de commande : elle ouvre un **panneau latéral** où l'on choisit un script et suit la progression.
+
+Tout reste **local** — l'extension parle uniquement à un petit **daemon HTTP local** (`127.0.0.1:47318`) qui télécharge la vidéo et lance le script. Aucun appel externe hormis `yt-dlp`.
+
+### Installation
+
+```bash
+cd chrome-extension
+./install.sh        # installe le daemon en service systemd utilisateur (sans sudo)
+```
+
+Puis dans le navigateur :
+1. ouvrir `chrome://extensions` → activer le **Mode développeur** (en haut à droite) ;
+2. **Charger l'extension non empaquetée** → sélectionner le dossier `~/traduction-extension` (créé par `install.sh`) ;
+3. sur une vidéo **YouTube/X**, cliquer l'icône **Traduction** pour ouvrir le panneau, choisir un script (`traduire`, `doubler`, `clipper`, `resumer`…), ajuster les options, puis **Lancer**. La progression s'affiche dans le panneau, le fichier produit est enregistré localement.
+
+> **Clés API (optionnel)** : les services systemd ne lisent pas `~/.bashrc`. Placez vos clés dans `~/.config/traduction-daemon.env` (`ANTHROPIC_API_KEY=…`, `HF_TOKEN=…`, mode 600), puis `systemctl --user restart traduction-daemon`. Sans clé Claude, tout tourne en **local** ; `HF_TOKEN` reste requis pour le doublage. Détails et dépannage : [`chrome-extension/README.md`](chrome-extension/README.md).
 
 ## Usage
 
