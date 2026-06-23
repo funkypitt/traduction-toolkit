@@ -285,15 +285,23 @@ python clipper.py video.mp4 --criteria "moment drôle" --post
 Les scripts supportent toutes les langues prises en charge par WhisperX et XTTS v2, notamment :
 anglais, français, espagnol, allemand, italien, portugais, néerlandais, russe, japonais, chinois, coréen, arabe, hindi, turc, polonais, suédois, danois, norvégien, finnois, tchèque, roumain, hongrois, grec, hébreu, thaï, vietnamien, ukrainien, indonésien, malais, catalan, basque, galicien.
 
-## Configuration matérielle
+## Configuration matérielle (GPU)
 
-| | Minimum | Recommandé |
-|---|---------|-----------|
-| GPU | Pas de GPU (CPU, très lent) | NVIDIA avec 6+ Go VRAM (RTX 3060+) |
-| RAM | 8 Go | 16 Go |
-| Disque | 10 Go (modèles) | 20 Go |
+La VRAM nécessaire dépend surtout du **moteur LLM** choisi (la traduction est l'étape la plus gourmande). Les tâches GPU étant **sérialisées** (un seul modèle en VRAM à la fois), c'est le **pic** qui compte, pas la somme.
 
-Les modèles sont téléchargés automatiquement au premier lancement (~5 Go pour WhisperX large-v3, ~2 Go pour XTTS v2).
+| Scénario | VRAM minimum | Cartes typiques |
+|---|---|---|
+| **LLM = Claude** (`--llm claude`) — sous-titres ou doublage | **~12 Go** | RTX 3060 12 Go / 4070 |
+| **LLM local léger** (`--ollama-model mistral-small:latest`) | **~16 Go** | RTX 4060 Ti 16 Go / 4080 |
+| **100 % local par défaut** (gemma4:31b traduction, qwen3.6:27b résumé) | **24 Go** | RTX 3090 / 4090 |
+
+En mode **Claude**, le pic GPU vient de **WhisperX large-v3** (~10 Go) ; le doublage ajoute Demucs, la diarisation et le TTS (chacun plus modeste, mais plus de temps de calcul). En mode **local**, le pic vient du **modèle Ollama** (~20 Go mesurés pour un 27-31B).
+
+- **RAM** : 16 Go recommandé (8 Go minimum, serré pour le doublage d'une longue vidéo).
+- **Disque** : ~10 Go (WhisperX large-v3 + XTTS v2, téléchargés au 1er lancement) **+ ~36 Go** si vous installez les modèles Ollama locaux par défaut (gemma4 + qwen3.6).
+- **Sans GPU** : techniquement possible mais **très lent** — déconseillé au-delà de quelques minutes de vidéo.
+
+> 💡 Carte ≤ 16 Go : gardez le local avec un modèle plus léger (`--ollama-model mistral-small:latest`), ou passez le LLM sur **Claude** (`--llm claude`). En cas d'OOM sur WhisperX, réduisez `WHISPER_BATCH_SIZE` (voir [Dépannage](#dépannage)).
 
 ## Fichiers produits
 
