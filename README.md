@@ -285,6 +285,18 @@ python clipper.py video.mp4 --criteria "moment drôle" --post
 Les scripts supportent toutes les langues prises en charge par WhisperX et XTTS v2, notamment :
 anglais, français, espagnol, allemand, italien, portugais, néerlandais, russe, japonais, chinois, coréen, arabe, hindi, turc, polonais, suédois, danois, norvégien, finnois, tchèque, roumain, hongrois, grec, hébreu, thaï, vietnamien, ukrainien, indonésien, malais, catalan, basque, galicien.
 
+## Compatibilité (Linux / Windows / macOS)
+
+Ce projet est conçu **pour Linux** (testé sur Ubuntu / Pop!_OS) avec un **GPU NVIDIA / CUDA**. C'est l'environnement de référence : tout y fonctionne sans bricolage (`install.sh`, paquet `.deb`, env conda, bridges TTS). Les autres OS sont possibles « pour les courageux », moyennant les obstacles ci-dessous.
+
+| OS | État | Obstacles à lever |
+|---|---|---|
+| **Linux** (Ubuntu/Pop!_OS, GPU NVIDIA) | ✅ **Supporté nativement** | — |
+| **Windows** | ⚠️ Via **WSL2** (recommandé) | Sous **WSL2 + Ubuntu + CUDA**, c'est identique à Linux. En **natif**, deux bloquants : (1) `install.sh` est du bash + `apt` → à refaire à la main (Miniconda Windows, ffmpeg, yt-dlp) ; (2) le **verrou GPU** s'appuie sur `fcntl` (module **Unix**, absent en Windows natif) → les scripts échouent à l'import tant qu'on ne remplace pas ce verrou (par ex. `msvcrt.locking` ou la lib `filelock`). Le `.deb` ne s'applique pas. |
+| **macOS** | ⚠️ Tourne, mais **lent** | Le code s'exécute (Unix, `fcntl` OK) et **Ollama fonctionne** sur Apple Silicon (Metal) ; mais **pas de CUDA** → WhisperX, Demucs, Pyannote et le TTS retombent sur **CPU (très lent)**. `install.sh` (`apt`) est à refaire avec **Homebrew**. Praticable pour de courts extraits / tests, pas pour de longues vidéos. |
+
+**En résumé** : Linux + NVIDIA = expérience cible ; sous Windows, passez par **WSL2**. Sur Windows natif ou macOS, c'est adaptable en levant les points ci-dessus (verrou `fcntl`, installeur `apt`→`brew`, accélération GPU).
+
 ## Configuration matérielle (GPU)
 
 La VRAM nécessaire dépend surtout du **moteur LLM** choisi (la traduction est l'étape la plus gourmande). Les tâches GPU étant **sérialisées** (un seul modèle en VRAM à la fois), c'est le **pic** qui compte, pas la somme.
