@@ -2705,6 +2705,16 @@ def process_one_file(input_path: str, args, claude_client, tts_backend=None,
 
     # ── PASSE 5 : Synthèse TTS (sur les SEGMENTS) ───────────────────────
     if tts_backend is None:
+        acquire_gpu_lock()   # sérialise même en reprise (--segments)
+        # Libérer la VRAM du LLM local avant de charger le modèle TTS (sinon
+        # le modèle Ollama résident + TTS = CUDA OOM sur 24 Go ; cf. 2026-06-23).
+        if getattr(args, 'llm', 'local') == "local":
+            try:
+                subprocess.run(["ollama", "stop", args.ollama_model],
+                               capture_output=True, timeout=30)
+                time.sleep(2)
+            except Exception:
+                pass
         model_choice = getattr(args, 'model', 'qwen3tts')
         if model_choice == "qwen3tts":
             tts_backend = Qwen3TTSBackend(

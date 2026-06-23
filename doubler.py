@@ -6934,6 +6934,17 @@ def main():
         sys.exit(0)
 
     # ── PASSE 6 : Synthèse TTS (two-pass avec speed natif) ─────────────────
+    acquire_gpu_lock()   # sérialise même en reprise (--segments saute la transcription)
+    # Libérer la VRAM du LLM local avant de charger le modèle TTS : sinon le
+    # modèle Ollama (ex. gemma4:31b ~20 Go) reste résident (keep_alive) et le
+    # TTS provoque un CUDA OOM sur 24 Go (révélé par le test du 2026-06-23).
+    if args.llm == "local":
+        try:
+            subprocess.run(["ollama", "stop", args.ollama_model],
+                           capture_output=True, timeout=30)
+            time.sleep(2)
+        except Exception:
+            pass
     tts = create_tts_backend(ref_voice=getattr(args, 'ref_voice', None),
                              target_lang=tgt_lang,
                              source_lang=src_lang,
