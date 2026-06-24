@@ -60,11 +60,20 @@ CLAUDE_RETRY_MAX = 5
 CLAUDE_RETRY_DELAY = 10.0
 
 # Ollama (LLM local — alternative gratuite à l'API Claude)
-# Défaut : qwen3.6:27b, raisonneur dense → résumés plus structurés/contrôlables
-# qu'un modèle purement génératif (cf. discussion 2026-06-22).
+# Défaut : mistral-small (14 Go) — tient ENTIÈREMENT en VRAM 24 Go (100% GPU,
+# ~53 tok/s) → 5,3× plus rapide de bout en bout que qwen3.6:27b (qui, à 25 Go
+# en exécution, déborde toujours ~12% sur le CPU → ~24 tok/s) ; qualité FR
+# équivalente (prose structurée, natif français). Bench/validation 2026-06-24.
+# qwen3.6:27b reste accessible via --ollama-model qwen3.6:27b (raisonneur dense).
 OLLAMA_URL = "http://localhost:11434"
-OLLAMA_MODEL = "qwen3.6:27b"
-OLLAMA_NUM_PREDICT = 16384         # marge large (tokens de réflexion inclus)
+OLLAMA_MODEL = "mistral-small:latest"
+OLLAMA_NUM_PREDICT = 6144          # sortie ~4000 mots max (réflexion désactivée) ; tient dans num_ctx
+OLLAMA_NUM_CTX_MAX = 24576        # plafond du contexte dynamique (couvre l'analyse ~20k tokens)
+# Synthèse locale : chunks plus petits que pour Claude → moins de prefill sur
+# CPU (qwen3.6:27b 25 Go ne tient pas en VRAM 24 Go, déborde toujours un peu) et
+# chaque appel reste dans un petit num_ctx → nettement plus rapide (cf. 2026-06-24).
+OLLAMA_SUMMARY_CHUNK_CHARS = 20000  # ~5000 tokens (vs 60000 pour Claude)
+OLLAMA_SINGLE_CALL_MAX_CHARS = 20000  # au-delà → 2 passes (vs 100000 pour Claude)
 
 # Chunks de traduction
 CHUNK_SIZE = 60
@@ -173,12 +182,20 @@ class _OllamaClient:
         if system:
             msgs.append({"role": "system", "content": system})
         msgs.extend(kwargs.get("messages", []))
+        # num_ctx DYNAMIQUE : on dimensionne le contexte à la taille réelle de
+        # l'entrée (~3 caractères/token en français, conservateur) + marge de
+        # sortie. Petits appels (chunks de synthèse) → petit contexte → qwen3.6:27b
+        # déborde MOINS sur le CPU (~27 tok/s à 12k vs ~18 à 32k) ; gros appel
+        # (analyse) → contexte élevé pour NE PAS tronquer. Borné à OLLAMA_NUM_CTX_MAX.
+        in_chars = sum(len(m.get("content", "")) for m in msgs)
+        need = in_chars // 3 + OLLAMA_NUM_PREDICT
+        num_ctx = max(4096, min(OLLAMA_NUM_CTX_MAX, ((need + 2047) // 2048) * 2048))
         payload = json.dumps({
             "model": self.model,
             "messages": msgs,
             "stream": False,
             "think": False,            # désactive la réflexion (raisonneurs type qwen3.6/qwen3)
-            "options": {"num_predict": OLLAMA_NUM_PREDICT},
+            "options": {"num_predict": OLLAMA_NUM_PREDICT, "num_ctx": num_ctx},
         }).encode()
         req = urllib.request.Request(
             f"{self.base_url}/api/chat",
@@ -364,10 +381,54 @@ def acquire_gpu_lock():
     print("   🔒 Verrou GPU acquis")
 
 
+def wait_for_vram_release(min_free_mib: int = 6000, timeout: float = 60.0,
+                          poll: float = 1.5) -> bool:
+    """Attend que la VRAM soit RÉELLEMENT libérée avant de charger WhisperX.
+    `ollama stop` n'unmappe pas les ~20 Go instantanément ; on sonde nvidia-smi
+    jusqu'à min_free_mib libres (cf. test du 2026-06-23)."""
+    deadline = time.time() + timeout
+    last_free = None
+    while time.time() < deadline:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.free",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10)
+            last_free = int(out.stdout.strip().splitlines()[0])
+        except Exception:
+            return True  # pas de nvidia-smi (CPU only) → inutile d'attendre
+        if last_free >= min_free_mib:
+            print(f"   ✅ VRAM libérée : {last_free} Mo disponibles")
+            return True
+        time.sleep(poll)
+    print(f"   ⚠️  VRAM encore basse après {timeout:.0f}s "
+          f"({last_free} Mo libres) — chargement tenté malgré tout")
+    return False
+
+
+def free_gpu_for_task(min_free_mib: int = 6000, timeout: float = 60.0):
+    """Décharge tout modèle Ollama résident (y compris ceux lancés hors toolkit,
+    ex. open-webui) puis VÉRIFIE la VRAM avant de charger WhisperX. Le verrou GPU
+    sérialise les tâches du toolkit, mais Ollama (keep_alive) vit EN DEHORS du
+    verrou et peut laisser un modèle de ~20 Go résident → OOM WhisperX."""
+    try:
+        ps = subprocess.run(["ollama", "ps"], capture_output=True,
+                            text=True, timeout=10)
+        for line in ps.stdout.splitlines()[1:]:
+            parts = line.split()
+            if parts:
+                subprocess.run(["ollama", "stop", parts[0]],
+                               capture_output=True, timeout=30)
+    except Exception:
+        pass
+    wait_for_vram_release(min_free_mib=min_free_mib, timeout=timeout)
+
+
 def transcribe_whisperx(audio_path: str, source_lang: Optional[str] = None,
                         hf_token: Optional[str] = None) -> tuple[list, str]:
     """Transcrit l'audio. Retourne (segments, langue_détectée)."""
     acquire_gpu_lock()
+    free_gpu_for_task(min_free_mib=6000, timeout=60)  # purge un Ollama résident avant WhisperX
     import whisperx, torch, gc
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -663,7 +724,8 @@ def generate_summary(segments: list[Segment], analysis: ContentAnalysis,
                      metadata: ResumeMetadata, client, claude_model: str,
                      target_words: int, context: str = "") -> str:
     """Génère le résumé structuré en markdown via Claude."""
-    if isinstance(client, _OllamaClient):
+    is_local = isinstance(client, _OllamaClient)
+    if is_local:
         acquire_gpu_lock()   # chemin --resume (pas de transcription) avec LLM local
     # Texte source : utiliser text_tgt si traduit, sinon text
     full_text = "\n".join(
@@ -699,8 +761,10 @@ RÈGLES STRICTES :
 8. PAS de table des matières, pas de « Introduction » ou « Conclusion » comme titres de section
 9. Rédige entièrement en français"""
 
-    # Pour les contenus courts (<100k chars) : un seul appel
-    if total_chars < 100000:
+    # Pour les contenus courts : un seul appel (seuil réduit en local pour
+    # garder l'appel dans un petit contexte GPU)
+    single_call_max = OLLAMA_SINGLE_CALL_MAX_CHARS if is_local else 100000
+    if total_chars < single_call_max:
         user_prompt = f"""{meta_block}{ctx_block}
 ANALYSE PRÉALABLE :
 Résumé : {analysis.summary}
@@ -723,7 +787,7 @@ Rédige le résumé structuré (~{target_words} mots)."""
     print(f"\n✍️  Synthèse Claude ({target_words} mots cible, 2 passes — contenu long)...")
 
     # Passe 1 : extraction des points clés par chunks
-    chunk_size_chars = 60000
+    chunk_size_chars = OLLAMA_SUMMARY_CHUNK_CHARS if is_local else 60000
     key_points = []
     chunks = []
     pos = 0
