@@ -25,7 +25,8 @@ L'installeur est **interactif** : il met en place ffmpeg, Miniconda, l'environne
 | `doubler-mp3-batch.py` | Doublage audio en lot (MP3/MP4 du dossier courant) | `fichier_fr.mp3` |
 | `resumer.py` | Résumé structuré d'une vidéo en PDF + EPUB | `video.pdf` + `video.epub` |
 | `clipper.py` | Extraction de clips viraux avec sous-titres karaoké | `clip.mp4` + `clip.txt` |
-| `monter.py` | Montage au stabilo : on surligne le texte transcrit, le montage suit | `video_montage.mp4` ou `.mp3` |
+| `monter.py` | Montage au stabilo : on surligne le texte à garder (ou à couper), le montage suit | `video_montage.mp4` ou `.mp3` |
+| `nettoyer.py` | Restauration audio à toucher léger (débruitage, normalisation) | `fichier_nettoye.mp3` |
 | `gui.py` | Panneau de contrôle web : tous les outils, montage compris | — |
 | `doctor.py` | Diagnostic et installation des dépendances | — |
 
@@ -331,7 +332,7 @@ python monter.py
 python monter.py entretien.mp4
 ```
 
-Le fichier est transcrit (WhisperX, horodatage mot par mot), le texte s'affiche à côté du lecteur, et l'on passe au stabilo ce que l'on garde :
+Le fichier est transcrit (WhisperX, horodatage mot par mot), le texte s'affiche à côté du lecteur, et l'on passe au stabilo ce que l'on garde. Le réglage **« Je surligne : ce que je garde / ce que je coupe »** inverse le sens : le texte sélectionné est rayé, et le montage garde tout le reste, du début du fichier à sa fin.
 
 - **glisser** sur le texte surligne ; l'outil **Gomme** (ou Alt + glisser) efface ;
 - **clic** sur un mot : la lecture reprend à cet endroit ; **double clic** : la phrase entière ;
@@ -339,7 +340,7 @@ Le fichier est transcrit (WhisperX, horodatage mot par mot), le texte s'affiche 
 - les passages sans paroles (silence, musique) apparaissent dans le texte et se surlignent comme un mot ;
 - **Voir le montage** joue les passages à la suite, avant de produire quoi que ce soit.
 
-Le montage est produit dans `output/` : vidéo MP4 (fondu au noir à chaque coupe) ou son MP3/M4A/WAV. Chaque coupe est placée dans le creux le plus calme autour du passage, jamais au ras d'un mot. Le surlignage est enregistré au fur et à mesure : on retrouve son travail en rouvrant le fichier.
+Le montage est produit dans `output/` : vidéo MP4 ou son MP3/M4A/WAV. À l'image, une coupe qui retire une seconde ou plus se fait par un fondu au noir ; une coupe plus courte (un mot, une hésitation) est franche, pour que l'écran ne clignote pas. Le son a toujours son fondu. Chaque coupe est placée dans le creux le plus calme autour du passage, jamais au ras d'un mot. Le surlignage est enregistré au fur et à mesure : on retrouve son travail en rouvrant le fichier.
 
 ## Langues supportées
 

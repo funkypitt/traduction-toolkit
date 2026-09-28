@@ -63,7 +63,9 @@ SEUIL_PAUSE = 2.0
 
 FONDU_DEFAUT = 0.5          # secondes
 FONDU_MAX = 3.0
-ECART_FUSION = 0.30         # deux coupes plus proches que ça n'en font qu'une
+# Un raccord qui retire moins que ça (un mot, une hésitation) se fait en coupe
+# franche à l'image : un fondu au noir y ferait clignoter l'écran.
+SEUIL_FONDU_IMAGE = 1.0
 ANTI_CLIC = 0.01            # fondu minimal, même avec « fondu = 0 »
 
 EXT_VIDEO = {".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".wmv", ".flv",
@@ -313,11 +315,9 @@ def point_calme(son, a: float, b: float, vise: float) -> float:
     return float(tc[int(np.argmin(np.abs(tc - vise)))])
 
 
-def calculer_coupes(dossier: Path, jetons: list, plages: list, fondu: float,
-                    duree: float) -> list:
-    """Plages de jetons [i, j] → coupes {d, f, fi, fo, plage} en secondes."""
-    n = len(jetons)
-    propres = []
+def plages_propres(plages: list, n: int) -> list:
+    """Plages de jetons triées, bornées, et réunies quand elles se touchent."""
+    brutes = []
     for p in plages:
         try:
             i, j = int(p[0]), int(p[1])
@@ -325,13 +325,46 @@ def calculer_coupes(dossier: Path, jetons: list, plages: list, fondu: float,
             continue
         i, j = max(0, min(i, j)), min(n - 1, max(i, j))
         if i <= j:
+            brutes.append((i, j))
+    propres = []
+    for i, j in sorted(brutes):
+        if propres and i <= propres[-1][1] + 1:
+            propres[-1] = (propres[-1][0], max(j, propres[-1][1]))
+        else:
             propres.append((i, j))
-    propres.sort()
+    return propres
+
+
+def complement(propres: list, n: int) -> list:
+    """Tout ce qui n'est pas dans les plages."""
+    reste, debut = [], 0
+    for i, j in propres:
+        if i > debut:
+            reste.append((debut, i - 1))
+        debut = j + 1
+    if debut < n:
+        reste.append((debut, n - 1))
+    return reste
+
+
+def calculer_coupes(dossier: Path, jetons: list, plages: list, fondu: float,
+                    duree: float, inverse: bool = False) -> list:
+    """Plages de jetons [i, j] → morceaux gardés {d, f, fi, fo, vi, vo, plage},
+    en secondes. Avec `inverse`, les plages sont ce qu'on retire : on garde tout
+    le reste, du début du fichier à sa fin."""
+    n = len(jetons)
+    propres = plages_propres(plages, n)
+    if inverse:
+        propres = complement(propres, n)
     if not propres:
         return []
 
     fin_media = duree if duree > 0 else jetons[-1][2]
     cible_av, cible_ap, portee = marges(fondu)
+    # L'horodatage d'un mot est juste à quelques centièmes près : en gardant, on
+    # laisse déborder d'autant sur le voisin pour ne pas rogner le mot gardé ;
+    # en coupant, on ne déborde pas, pour ne rien laisser du mot retiré.
+    debord = 0.0 if inverse else 0.04
 
     son = None
     wav = dossier / "audio16k.wav"
@@ -356,10 +389,20 @@ def calculer_coupes(dossier: Path, jetons: list, plages: list, fondu: float,
                 k += 1
             deb_suiv = jetons[k][1] if k < n else fin_media
 
-            a = max(0.0, fin_prec - 0.04, d_brut - portee)
+            a = max(0.0, fin_prec - debord, d_brut - portee)
             d = point_calme(son, min(a, d_brut), d_brut, d_brut - cible_av)
-            b = min(fin_media, deb_suiv + 0.04, f_brut + portee)
+            b = min(fin_media, deb_suiv + debord, f_brut + portee)
             f = point_calme(son, f_brut, max(b, f_brut), f_brut + cible_ap)
+            if inverse and i == 0:
+                d = 0.0
+            if inverse and j == n - 1:
+                f = fin_media
+            if coupes and d < coupes[-1]["f"]:
+                # Ce qui est retiré entre les deux est trop court pour deux
+                # marges : on coupe une seule fois, en son milieu.
+                milieu = (jetons[coupes[-1]["plage"][1] + 1][1] + jetons[i - 1][2]) / 2.0
+                milieu = min(max(milieu, coupes[-1]["d"] + 0.05), f)
+                coupes[-1]["f"] = d = milieu
             if f - d < 0.05:
                 continue
 
@@ -369,16 +412,14 @@ def calculer_coupes(dossier: Path, jetons: list, plages: list, fondu: float,
             else:
                 fi = fo = ANTI_CLIC
 
-            if coupes and d - coupes[-1]["f"] < ECART_FUSION:
-                coupes[-1]["f"] = max(f, coupes[-1]["f"])
-                coupes[-1]["fo"] = fo
-                coupes[-1]["plage"][1] = j
-            else:
-                coupes.append({"d": d, "f": f, "fi": fi, "fo": fo, "plage": [i, j]})
+            coupes.append({"d": d, "f": f, "fi": fi, "fo": fo, "plage": [i, j]})
     finally:
         if son is not None:
             son.close()
 
+    for k, c in enumerate(coupes):
+        c["vi"] = k == 0 or c["d"] - coupes[k - 1]["f"] >= SEUIL_FONDU_IMAGE
+        c["vo"] = k == len(coupes) - 1 or coupes[k + 1]["d"] - c["f"] >= SEUIL_FONDU_IMAGE
     for c in coupes:
         moitie = (c["f"] - c["d"]) / 2.0
         c["d"], c["f"] = round(c["d"], 3), round(c["f"], 3)
@@ -452,8 +493,10 @@ def produire_video(tache: dict, source: str, coupes: list, fondu: float,
             vf = []
             if fondu_image and fondu > 0:
                 fv = min(fondu, dur / 2.0)
-                vf.append(f"fade=t=in:st=0:d={fv:.3f}")
-                vf.append(f"fade=t=out:st={dur - fv:.3f}:d={fv:.3f}")
+                if c.get("vi", True):
+                    vf.append(f"fade=t=in:st=0:d={fv:.3f}")
+                if c.get("vo", True):
+                    vf.append(f"fade=t=out:st={dur - fv:.3f}:d={fv:.3f}")
             af = [f"afade=t=in:st=0:d={c['fi']:.3f}:curve=hsin",
                   f"afade=t=out:st={max(0.0, dur - c['fo']):.3f}:d={c['fo']:.3f}:curve=hsin"]
             morceau = tmp / f"passage_{k:04d}.mkv"
@@ -844,6 +887,7 @@ def creer_blueprint():
         sel = lire_json(dossier / "selection.json", {}) or {}
         return jsonify({"jetons": jetons, "langue": langue,
                         "plages": sel.get("plages", []),
+                        "mode": sel.get("mode", "garder"),
                         "fondu": sel.get("fondu", FONDU_DEFAUT)})
 
     def lire_demande(dossier, projet, pid):
@@ -859,9 +903,17 @@ def creer_blueprint():
             fondu = FONDU_DEFAUT
         fondu = min(max(fondu, 0.0), FONDU_MAX)
         plages = data.get("plages") or []
-        coupes = calculer_coupes(dossier, jetons, plages, fondu,
-                                 projet.get("duree") or 0.0)
-        ecrire_json(dossier / "selection.json", {"plages": plages, "fondu": fondu})
+        # « garder » : le surligné fait le montage ; « couper » : il en est retiré
+        mode = "couper" if data.get("mode") == "couper" else "garder"
+        data["mode"] = mode
+        if mode == "couper" and not plages_propres(plages, len(jetons)):
+            coupes = []             # rien de rayé : il n'y a pas de montage à faire
+        else:
+            coupes = calculer_coupes(dossier, jetons, plages, fondu,
+                                     projet.get("duree") or 0.0,
+                                     inverse=(mode == "couper"))
+        ecrire_json(dossier / "selection.json",
+                    {"plages": plages, "fondu": fondu, "mode": mode})
         return data, fondu, coupes
 
     @app.route("/api/selection/<pid>", methods=["POST"])
@@ -891,7 +943,9 @@ def creer_blueprint():
         if fmt not in permis:
             return jsonify({"erreur": "Ce format n'est pas proposé pour ce fichier."}), 400
         if not coupes:
-            return jsonify({"erreur": "Aucun passage n'est surligné."}), 400
+            if data["mode"] == "garder" or not data.get("plages"):
+                return jsonify({"erreur": "Aucun passage n'est surligné."}), 400
+            return jsonify({"erreur": "Tout est rayé : il ne reste rien à monter."}), 400
         if not os.path.isfile(projet["source"]):
             return jsonify({"erreur": "Le fichier d'origine est introuvable."}), 400
         for t in TACHES.values():
@@ -996,6 +1050,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   --ok:#4ad27e; --danger:#e04b4b;
   --papier:#f6f2e8; --encre:#23211d; --encre2:#8b8578; --filet:#e2dccd;
   --stabilo:#ffe84a; --stabilo-pre:#fff3a0; --gomme:#e9e4d8;
+  --raye:#ffc9c2; --raye-pre:#ffe1dc; --raye-encre:#8f3a31;
 }
 *{box-sizing:border-box}
 html,body{margin:0;height:100%}
@@ -1030,8 +1085,8 @@ input:focus,select:focus{border-color:var(--accent)}
 
 /* ── Atelier ── */
 #atelier{height:100vh;display:flex;flex-direction:column}
-#barre{flex:none;display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--border);background:var(--panel2)}
-#titre{min-width:0;flex:1}
+#barre{flex:none;display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--border);background:var(--panel2)}
+#titre{min-width:160px;flex:1}
 #titre .n{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #titre .d{font-size:12px;color:var(--muted)}
 .outils{display:flex;border:1px solid var(--border);border-radius:9px;overflow:hidden}
@@ -1091,6 +1146,15 @@ input:focus,select:focus{border-color:var(--accent)}
 .m.pause{font:12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--encre2);border:1px dashed #cfc8b6;border-radius:20px;padding:4px 12px;box-shadow:none}
 .m.pause.s,.m.pause.pre{color:var(--encre);border-style:solid;border-color:#d9c23a;border-radius:20px;box-shadow:none}
 .gomme #texte{cursor:cell}
+/* Mode « ce que je coupe » : le surligné est rayé */
+.couper .m.s{background:var(--raye);box-shadow:.3em 0 0 var(--raye);color:var(--raye-encre);text-decoration:line-through;text-decoration-color:#c9544a}
+.couper .m.s.sf{box-shadow:none}
+.couper .m.s.lu{text-decoration:underline line-through;text-decoration-color:#c9544a}
+.couper .m.pre{background:var(--raye-pre);box-shadow:.3em 0 0 var(--raye-pre)}
+.couper .m.pause.s,.couper .m.pause.pre{border-color:#d98a82;box-shadow:none}
+.couper .outils button#o-stabilo.actif,.outils button#m-couper.actif{background:var(--raye);color:#4a1712}
+#modes{align-items:center}
+#modes span{padding:0 4px 0 12px;font-size:12px;color:var(--muted);white-space:nowrap}
 #patience{max-width:560px;margin:16vh auto 0;padding:0 28px;text-align:center;font:17px/1.6 "Iowan Old Style","Palatino Linotype",Georgia,serif;color:var(--encre)}
 #patience .rond{width:34px;height:34px;border-radius:50%;border:3px solid var(--filet);border-top-color:#e0621a;margin:0 auto 22px;animation:tour 1s linear infinite}
 #patience.erreur .rond{display:none}
@@ -1125,7 +1189,7 @@ input:focus,select:focus{border-color:var(--accent)}
 <div id="accueil">
   <div class="carte">
     <h1>Montage au <mark>stabilo</mark></h1>
-    <p class="chapeau">Choisissez une vidéo ou un enregistrement. Le texte s'affiche, vous surlignez ce que vous gardez, le montage se fait tout seul.</p>
+    <p class="chapeau">Choisissez une vidéo ou un enregistrement. Le texte s'affiche, vous surlignez ce que vous gardez, ou ce que vous retirez, et le montage se fait tout seul.</p>
     <div class="ligne">
       <input type="text" id="chemin" placeholder="Emplacement du fichier" spellcheck="false">
       <button class="btn" id="b-parcourir">Parcourir…</button>
@@ -1143,6 +1207,11 @@ input:focus,select:focus{border-color:var(--accent)}
 <div id="atelier" hidden>
   <div id="barre">
     <div id="titre"><div class="n"></div><div class="d"></div></div>
+    <div class="outils" id="modes">
+      <span>Je surligne</span>
+      <button id="m-garder" class="actif" title="Le montage est fait de ce qui est surligné">ce que je garde</button>
+      <button id="m-couper" title="Le montage est fait de tout le reste">ce que je coupe</button>
+    </div>
     <div class="outils">
       <button id="o-stabilo" class="actif" title="Surligner (S)">Stabilo</button>
       <button id="o-gomme" title="Effacer le surlignage (G)">Gomme</button>
@@ -1236,6 +1305,7 @@ let sel = new Uint8Array(0);
 let spans = [];
 let histo = [], futur = [];
 let outil = 'stabilo';
+let mode = 'garder';     // 'garder' : le surligné fait le montage ; 'couper' : il en est retiré
 let coupes = [];
 let lecteur = null;
 let envoi = null, numeroEnvoi = 0;
@@ -1350,6 +1420,7 @@ $('#choix .liste').onclick = e => {
 function installer(p){
   P = p; J = []; sel = new Uint8Array(0); spans = []; histo = []; futur = [];
   coupes = []; montage = -1; tache = null; lecteur = null;
+  afficherMode('garder');
   clearTimeout(veille);
   $('#accueil').hidden = true; $('#atelier').hidden = false;
   document.title = p.nom + ' — Montage au stabilo';
@@ -1429,6 +1500,7 @@ async function chargerTexte(){
   for (const [a, b] of d.plages)
     for (let i = Math.max(0, a); i <= Math.min(J.length - 1, b); i++) sel[i] = 1;
   if ([...$('#fondu').options].some(o => parseFloat(o.value) === d.fondu)) $('#fondu').value = String(d.fondu);
+  afficherMode(d.mode);
   rendre(); peindre(0, J.length - 1); bilan(); boutons();
   if (plages().length) envoyer(0);
 }
@@ -1494,8 +1566,8 @@ function boutons(){
   $('#b-annuler').disabled = !histo.length;
   $('#b-retablir').disabled = !futur.length;
   $('#b-effacer').disabled = !n;
-  $('#b-produire').disabled = !n || (tache !== null);
-  $('#b-ecouter').disabled = !n || !lecteur;
+  $('#b-produire').disabled = !n || !coupes.length || (tache !== null);
+  $('#b-ecouter').disabled = !n || !coupes.length || !lecteur;
 }
 function annuler(){
   if (!histo.length) return;
@@ -1518,6 +1590,21 @@ function choisirOutil(o){
   document.body.classList.toggle('gomme', o === 'gomme');
 }
 $('#o-stabilo').onclick = () => choisirOutil('stabilo');
+function afficherMode(m){
+  mode = m === 'couper' ? 'couper' : 'garder';
+  $('#m-garder').classList.toggle('actif', mode === 'garder');
+  $('#m-couper').classList.toggle('actif', mode === 'couper');
+  document.body.classList.toggle('couper', mode === 'couper');
+  $('#o-stabilo').title = (mode === 'couper' ? 'Rayer' : 'Surligner') + ' (S)';
+}
+function choisirMode(m){
+  if (m === mode || !J.length) return;
+  afficherMode(m);
+  finMontage(); coupes = []; bilan(); boutons();
+  envoyer(0);
+}
+$('#m-garder').onclick = () => choisirMode('garder');
+$('#m-couper').onclick = () => choisirMode('couper');
 $('#o-gomme').onclick = () => choisirOutil('gomme');
 
 /* ── Geste du stabilo ────────────────────────────────────── */
@@ -1652,43 +1739,60 @@ function envoyer(delai){
   envoi = setTimeout(async () => {
     const n = ++numeroEnvoi, pid = P.id;
     try {
-      const d = await api('/api/selection/' + pid, {plages: plages(), fondu: parseFloat($('#fondu').value)});
+      const d = await api('/api/selection/' + pid, {plages: plages(), mode, fondu: parseFloat($('#fondu').value)});
       if (n !== numeroEnvoi || !P || P.id !== pid) return;
-      coupes = d.coupes; bilan(d.duree);
+      coupes = d.coupes; bilan(d.duree); boutons();
     } catch(e) {}
   }, delai);
 }
 $('#fondu').onchange = () => envoyer(0);
 
+function extrait(a, b){
+  const mots = [];
+  for (let i = a; i <= b && mots.length < 16; i++) if (J[i][0] !== null) mots.push(J[i][0]);
+  return esc(mots.join(' ')) || 'Sans paroles';
+}
+function ligne(a, b, t, duree, titre){
+  return `<div class="passage" data-a="${a}" data-b="${b}" data-t="${t}"><div class="h">${hms(t)}</div>
+    <div class="x">${extrait(a, b)}</div><div class="l">${enClair(duree)}</div>
+    <button class="r" title="${titre}">×</button></div>`;
+}
 function bilan(duree){
-  const n = coupes.length;
+  const n = coupes.length, couper = mode === 'couper';
   if (!J.length) { $('#bilan-duree').textContent = '—'; $('#bilan-detail').textContent = ''; $('#passages').innerHTML = ''; return; }
-  if (!plages().length) {
+  const pl = plages();
+  if (!pl.length) {
     coupes = [];
-    $('#bilan-duree').textContent = 'Rien de surligné';
+    $('#bilan-duree').textContent = couper ? 'Rien de rayé' : 'Rien de surligné';
     $('#bilan-detail').textContent = '';
-    $('#passages').innerHTML = '<div id="vide">Glissez sur le texte pour surligner ce que vous gardez.<br>Un clic sur un mot lance la lecture à cet endroit. Un double clic surligne la phrase entière. Pour un long passage, cliquez sur son premier mot puis, majuscule enfoncée, sur son dernier.</div>';
+    $('#passages').innerHTML = '<div id="vide">' + (couper
+      ? 'Glissez sur le texte pour rayer ce que vous retirez : le montage garde tout le reste.'
+      : 'Glissez sur le texte pour surligner ce que vous gardez.')
+      + '<br>Un clic sur un mot lance la lecture à cet endroit. Un double clic prend la phrase entière. Pour un long passage, cliquez sur son premier mot puis, majuscule enfoncée, sur son dernier.</div>';
     return;
   }
   if (duree === undefined) return;
-  $('#bilan-duree').textContent = 'Montage de ' + enClair(duree);
-  $('#bilan-detail').textContent = n + (n > 1 ? ' passages' : ' passage') + ' sur ' + enClair(P.duree);
-  $('#passages').innerHTML = coupes.map((c, k) => {
-    const mots = [];
-    for (let i = c.plage[0]; i <= c.plage[1] && mots.length < 16; i++) if (J[i][0] !== null && sel[i]) mots.push(J[i][0]);
-    return `<div class="passage" data-k="${k}"><div class="h">${hms(c.d)}</div>
-      <div class="x">${esc(mots.join(' ')) || 'Sans paroles'}</div><div class="l">${enClair(c.f - c.d)}</div>
-      <button class="r" title="Retirer ce passage">×</button></div>`;
-  }).join('');
+  if (!couper) {
+    $('#bilan-duree').textContent = 'Montage de ' + enClair(duree);
+    $('#bilan-detail').textContent = n + (n > 1 ? ' passages' : ' passage') + ' sur ' + enClair(P.duree);
+    // Un morceau gardé peut réunir deux passages surlignés voisins
+    $('#passages').innerHTML = coupes.map(c => ligne(c.plage[0], c.plage[1], c.d, c.f - c.d, 'Retirer ce passage')).join('');
+    return;
+  }
+  // Mode « ce que je coupe » : la liste montre ce qui est retiré
+  $('#bilan-duree').textContent = n ? 'Montage de ' + enClair(duree) : 'Il ne reste rien';
+  const retire = Math.max(0, P.duree - duree);
+  $('#bilan-detail').textContent = pl.length + (pl.length > 1 ? ' coupes' : ' coupe') + ' · '
+    + enClair(retire) + ' en moins sur ' + enClair(P.duree);
+  $('#passages').innerHTML = pl.map(([a, b]) => ligne(a, b, J[a][1], J[b][2] - J[a][1], 'Garder ce passage')).join('');
 }
 $('#passages').onclick = e => {
   const l = e.target.closest('.passage');
   if (!l) return;
-  const c = coupes[+l.dataset.k];
-  if (!c) return;
-  if (e.target.closest('.r')) { changer(c.plage[0], c.plage[1], 0); return; }
-  spans[c.plage[0]].scrollIntoView({block: 'center', behavior: 'smooth'});
-  aller(c.d, false);
+  const a = +l.dataset.a, b = +l.dataset.b;
+  if (e.target.closest('.r')) { changer(a, b, 0); return; }
+  spans[a].scrollIntoView({block: 'center', behavior: 'smooth'});
+  aller(parseFloat(l.dataset.t), false);
 };
 
 /* ── Production ──────────────────────────────────────────── */
@@ -1696,7 +1800,7 @@ $('#b-produire').onclick = async () => {
   $('#echec').hidden = true;
   try {
     const d = await api('/api/produire/' + P.id, {
-      plages: plages(), fondu: parseFloat($('#fondu').value),
+      plages: plages(), mode, fondu: parseFloat($('#fondu').value),
       format: $('#format').value, fondu_image: $('#fondu-image').checked});
     tache = d.id;
     $('#reglages').hidden = true; $('#fini').hidden = true; $('#suivi').hidden = false;

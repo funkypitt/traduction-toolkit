@@ -659,8 +659,10 @@ def score_dnsmos(audio, sr, positions):
         if rms < 1e-6:
             continue
         fenetre = fenetre * (db_vers_lineaire(-26) / rms)
-        fenetre = np.clip(fenetre, -1.0, 1.0)
         fenetre_16k = librosa.resample(fenetre, orig_sr=sr, target_sr=16000)
+        # clip APRES le resample : le rééchantillonnage peut légèrement dépasser
+        # ±1.0 (ringing) et dnsmos.run refuse tout échantillon hors [-1, 1]
+        fenetre_16k = np.clip(fenetre_16k, -1.0, 1.0)
         r = dnsmos.run(fenetre_16k, sr=16000)
         scores["sig"].append(r["sig_mos"])
         scores["bak"].append(r["bak_mos"])
