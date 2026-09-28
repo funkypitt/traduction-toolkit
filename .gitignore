@@ -54,3 +54,6 @@ essais-nettoyage/
 
 # Dépôt git imbriqué (son propre historique)
 satipanya-podcast/
+
+# Restored/hosted dhamma-talk audio (regenerable via second-week/scripts/acquire_v5*.py + nettoyer.py)
+notable-dhamma-teachers/site/mp3/

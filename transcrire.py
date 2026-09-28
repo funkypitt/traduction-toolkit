@@ -827,7 +827,7 @@ def call_claude_api(client, model: str, system: str, user_msg: str,
 
             api_stats.record(message)
 
-            result = message.content[0].text
+            result = next((b.text for b in message.content if b.type == "text"), "")
             if not result or not result.strip():
                 raise ValueError("Réponse API vide")
 
@@ -1777,8 +1777,8 @@ Variables d'environnement requises :
     )
 
     # Modèles
-    parser.add_argument("--model", default="claude-opus-4-5",
-                        help="Modèle Claude à utiliser (défaut: claude-opus-4-5, "
+    parser.add_argument("--model", default="claude-opus-5",
+                        help="Modèle Claude à utiliser (défaut: claude-opus-5, "
                              "cf. A/B 2026-05-25 dans traduire.py)")
     parser.add_argument("--whisper-model", default="large-v3",
                         help="Modèle Whisper (tiny, base, small, medium, large-v3)")

@@ -4,7 +4,7 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 # Testé sur Ubuntu 22.04 / 24.04 avec GPU NVIDIA.
 # Installe : Miniconda (si absent), environnement Python 3.11, toutes les
-# dépendances (torch+CUDA, whisperx, XTTS v2, demucs, etc.), ffmpeg, yt-dlp.
+# dépendances (torch+CUDA, whisperx, demucs, etc.), ffmpeg, yt-dlp.
 #
 # Usage :
 #   chmod +x install.sh
@@ -159,10 +159,6 @@ pip install -q demucs pydub soundfile numpy
 info "  praat-parselmouth, pyworld..."
 pip install -q praat-parselmouth pyworld
 
-# XTTS v2 (synthèse vocale — backend de doublage dans l'env principal)
-info "  TTS (Coqui XTTS v2) — peut prendre quelques minutes..."
-pip install -q TTS
-
 # GUI (panneau de contrôle web)
 info "  flask (GUI)..."
 pip install -q flask
@@ -175,7 +171,7 @@ ok "Toutes les dépendances Python installées"
 
 # ── 6b. Backend TTS du doublage (env conda isolé) ────────────────────────────
 # Backend de doublage par défaut : Qwen3-TTS, dans son PROPRE env conda (bridge).
-# Alternative : XTTS v2, déjà inclus dans l'env principal (--tts xtts).
+# Alternative : ElevenLabs (API cloud, --tts elevenlabs).
 echo ""
 read -p "   Installer le backend TTS par défaut Qwen3-TTS (env conda dédié) ? (O/n) " -n 1 -r
 echo ""
@@ -189,7 +185,7 @@ if [[ ! $REPLY =~ ^[Nn]$ ]]; then
         ok "Backend Qwen3-TTS installé (env 'qwen3tts')"
     fi
 else
-    warn "Qwen3-TTS ignoré — le doublage utilisera XTTS v2 (--tts xtts), inclus dans l'env principal."
+    warn "Qwen3-TTS ignoré — le doublage ne fonctionnera qu'avec ElevenLabs (--tts elevenlabs, clé API requise)."
 fi
 
 # ── 6c. LLM local (Ollama) — alternative gratuite à l'API Claude ──────────────
@@ -296,7 +292,6 @@ check_pkg "soundfile"    "soundfile     (I/O audio)"
 check_pkg "numpy"        "numpy         (calcul numérique)"
 check_pkg "parselmouth"  "parselmouth   (analyse acoustique)"
 check_pkg "pyworld"      "pyworld       (vocoder WORLD)"
-check_pkg "TTS"          "TTS           (XTTS v2)"
 
 if command -v ffmpeg &>/dev/null; then
     ok "ffmpeg        (traitement vidéo)"

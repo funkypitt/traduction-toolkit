@@ -143,7 +143,7 @@ def fetch_apollo_page(url: str, cookies: dict) -> ApolloHealthPage:
         raise
 
     # Vérifier qu'on n'est pas redirigé vers la page de login
-    if 'name="user[email]"' in html or '<form' in html[:3000] and 'sign_in' in html[:3000]:
+    if "Already Registered?" in html or 'name="user[email]"' in html or '<form' in html[:3000] and 'sign_in' in html[:3000]:
         raise RuntimeError(
             "Redirigé vers la page de connexion — cookies expirés.\n"
             "   → Re-exportez vos cookies depuis votre navigateur (Cookie-Editor)")

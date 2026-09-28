@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pipeline de traduction vocale IA — batch MP3/MP4 (Qwen3-TTS / XTTS)
+Pipeline de traduction vocale IA — batch MP3/MP4 (Qwen3-TTS)
 ==================================================================================
 Traite tous les fichiers .mp3 et .mp4 du dossier courant et produit
 pour chacun un MP3 traduit dans la langue cible. La piste de sortie
@@ -32,12 +32,12 @@ Architecture SEGMENT-PAR-SEGMENT en 9 passes :
 
 POURQUOI SEGMENT-PAR-SEGMENT (et pas par blocs fusionnés) :
   Les segments WhisperX sont courts (~50-150 caractères), ce qui est idéal
-  pour XTTS v2 dont le décodeur autorégressif boucle au-delà de ~250 car.
+  pour un décodeur TTS autorégressif, qui dérive sur les textes longs.
   En synthétisant chaque segment individuellement :
   - Pas besoin de re-découper en phrases (split_into_sentences)
   - Pas de crossfade destructif entre phrases
   - Pas de _trim_silence qui mange les consonnes douces
-  - Chaque segment tient dans les limites XTTS sans manipulation
+  - Chaque segment tient dans les limites du moteur TTS sans manipulation
   
   Le contexte de traduction est préservé grâce au fenêtrage : Claude voit
   les segments précédents/suivants mais ne traduit que la fenêtre courante.
@@ -45,8 +45,6 @@ POURQUOI SEGMENT-PAR-SEGMENT (et pas par blocs fusionnés) :
 Usage :
   python doubler-mp3-batch.py                                    # EN → FR, tous les MP3+MP4
   python doubler-mp3-batch.py -s en -t es                        # EN → ES
-  python doubler-mp3-batch.py --xtts-speaker "Craig Gutsy"       # voix preset XTTS
-  python doubler-mp3-batch.py --ref-voice ref_fr.wav             # voix de référence
   python doubler-mp3-batch.py --speakers 1                       # monologue (pas de diarisation)
   python doubler-mp3-batch.py --context "podcast tech, registre familier"
   python doubler-mp3-batch.py --file specific.mp3                # un seul fichier
@@ -106,11 +104,12 @@ WHISPER_MODEL = "large-v3"
 WHISPER_BATCH_SIZE = 16
 WHISPER_COMPUTE_TYPE = "float16"
 
-CLAUDE_MODEL = "claude-opus-4-5"  # cf. A/B 2026-05-25 (traduire.py) : sonnet-4-6
+CLAUDE_MODEL = "claude-opus-5"  # cf. A/B 2026-05-25 (traduire.py) : sonnet-4-6
 # produit doublons synonymiques et étoffements malgré prompt explicite.
 CLAUDE_MAX_TOKENS = 8192
-CLAUDE_RETRY_MAX = 5
+CLAUDE_RETRY_MAX = 10
 CLAUDE_RETRY_DELAY = 10.0
+CLAUDE_RETRY_DELAY_MAX = 120.0     # plafond du backoff exponentiel
 
 SAMPLE_RATE = 44100
 MIN_SPEAKER_SAMPLE_SEC = 5
@@ -300,7 +299,13 @@ def _claude_create(client, **kwargs):
     is_local = isinstance(client, _OllamaClient)
     for attempt in range(1, CLAUDE_RETRY_MAX + 1):
         try:
-            return client.messages.create(**kwargs)
+            resp = client.messages.create(**kwargs)
+            if not is_local:
+                # Opus 5 pense par défaut : les blocs thinking précèdent le texte.
+                # On les retire pour que resp.content[0] reste le texte / tool_use.
+                resp.content = [b for b in resp.content
+                                if b.type not in ("thinking", "redacted_thinking")]
+            return resp
         except Exception as exc:
             retryable = False
             if is_local:
@@ -313,7 +318,7 @@ def _claude_create(client, **kwargs):
                 elif isinstance(exc, anthropic.APIConnectionError):
                     retryable = True
             if retryable and attempt < CLAUDE_RETRY_MAX:
-                delay = CLAUDE_RETRY_DELAY * (2 ** (attempt - 1))
+                delay = min(CLAUDE_RETRY_DELAY * (2 ** (attempt - 1)), CLAUDE_RETRY_DELAY_MAX)
                 label = "Ollama" if is_local else "API Claude"
                 print(f"   ⏳ {label} erreur ({type(exc).__name__}), retry {attempt}/{CLAUDE_RETRY_MAX} dans {delay:.0f}s...")
                 time.sleep(delay)
@@ -354,15 +359,6 @@ class SpeakerProfile:
     gender: str = "unknown"
     f0_median: float = 0.0
 
-
-# Limites de caractères XTTS par langue (au-delà, l'audio est tronqué)
-# Source : Coqui TTS tokenizer limits. On prend une marge de sécurité.
-XTTS_CHAR_LIMITS = {
-    "fr": 273, "en": 250, "es": 253, "de": 253, "it": 213, "pt": 253,
-    "pl": 253, "tr": 226, "ru": 182, "nl": 253, "cs": 253, "ar": 166,
-    "zh": 82, "ja": 100, "ko": 100, "hu": 253, "hi": 150,
-}
-XTTS_CHAR_LIMIT_DEFAULT = 230  # fallback conservateur
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # VÉRIFICATIONS
@@ -429,11 +425,6 @@ def check_dependencies(tts_backend="qwen3tts", local=False):
         else:
             print("   qwen3tts    : ❌  → conda create -n qwen3tts python=3.12 && "
                   "conda run -n qwen3tts pip install -U qwen-tts soundfile"); ok = False
-    else:
-        try:
-            __import__("TTS"); print("   xtts-v2     : ✅")
-        except ImportError:
-            print("   xtts-v2     : ❌  → pip install TTS --break-system-packages"); ok = False
 
     if not local and not os.environ.get("ANTHROPIC_API_KEY"):
         print("   ⚠️  ANTHROPIC_API_KEY non définie"); ok = False
@@ -927,7 +918,7 @@ def translate_segments(segments, analysis, client, src_lang, tgt_lang, context="
     Chaque segment WhisperX est traduit individuellement, mais Claude voit
     les segments précédents et suivants pour le contexte. Cela donne :
     - Des traductions qui tiennent compte du contexte (comme les blocs)
-    - Des segments courts qui passent directement dans XTTS (pas de split)
+    - Des segments courts qui passent directement dans le TTS (pas de split)
     - Aucune manipulation destructive (pas de merge/split/crossfade)
     """
     print(f"\n🌍 Passe 4b — Traduction par segments {src_lang}→{tgt_lang}...")
@@ -1293,19 +1284,19 @@ Format : [S<numéro>] texte corrigé (un par ligne)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PASSE 5 : SYNTHÈSE VOCALE PAR SEGMENTS (XTTS v2)
+# PASSE 5 : SYNTHÈSE VOCALE PAR SEGMENTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Nettoyage du texte pour éviter les artefacts TTS ────────────────────────
 
-def sanitize_for_tts(text: str, lang: str = "fr", backend: str = "xtts") -> str:
+def sanitize_for_tts(text: str, lang: str = "fr", backend: str = "qwen3tts") -> str:
     """
     Nettoyage phonétique pré-TTS : supprime les caractères que les moteurs TTS
     prononcent littéralement ("point", "guillemet", etc.).
     Principe : le texte doit contenir UNIQUEMENT ce qu'on veut entendre.
 
-    Tous les backends : les points "." sont remplacés par ";" (pause naturelle
-    sans vocalisation). Aucun moteur TTS ne prononce le point-virgule.
+    Les points de fin de phrase sont conservés (intonation descendante sur
+    Qwen3-TTS, cf. étape 9).
     """
     if not text:
         return text
@@ -1353,7 +1344,7 @@ def sanitize_for_tts(text: str, lang: str = "fr", backend: str = "xtts") -> str:
     if lang == "fr":
         text = re.sub(r'(\d)\.(\d)', r'\1 virgule \2', text)
 
-    # 5. Guillemets (XTTS les lit parfois comme "guillemet")
+    # 5. Guillemets (parfois lus comme "guillemet")
     text = re.sub(r'[«»""„]', '', text)
     text = text.replace('"', '')
 
@@ -1362,7 +1353,7 @@ def sanitize_for_tts(text: str, lang: str = "fr", backend: str = "xtts") -> str:
     # Tirets entourés d'espaces → espace simple (préserve mots composés)
     text = re.sub(r'\s+-\s+', ' ', text)
 
-    # 7. Caractères spéciaux que XTTS pourrait vocaliser
+    # 7. Caractères spéciaux que le moteur pourrait vocaliser
     text = re.sub(r'[#*_~`|\\]', '', text)
     # Contenu entre parenthèses/crochets → supprimé (souvent des didascalies)
     text = re.sub(r'\([^)]*\)', '', text)
@@ -1374,23 +1365,23 @@ def sanitize_for_tts(text: str, lang: str = "fr", backend: str = "xtts") -> str:
                      "ja": "と", "zh": "和", "ko": "와"}
     text = text.replace("&", f" {ampersand_map.get(lang, 'et')} ")
 
-    # 9. NUCLEAR FIX : remplacer TOUS les points restants par des points-virgules.
-    # Tous les backends TTS (XTTS, Qwen3-TTS) vocalisent "."
-    # comme "point" en français. Le point-virgule produit une pause naturelle de
-    # frontière de phrase sans jamais être prononcé par aucun moteur TTS.
-    # Les abréviations (M., etc.), acronymes (P.D.G.) et décimales (3.14) ont déjà
-    # été traités plus haut — il ne reste que des points de fin de phrase.
-    text = text.replace('.', ';')
+    # 9. Points de fin de phrase. Les abréviations (M., etc.), acronymes (P.D.G.)
+    # et décimales (3.14) ont déjà été traités plus haut — il ne reste qu'eux.
+    # Qwen3-TTS : on les GARDE. Comparatif du 2026-09-20 (essais-ponctuation/) :
+    # avec « . » la phrase retombe (pente F0 finale −27/−20 Hz/s), avec « ; »
+    # elle reste en suspens (−9/+17 Hz/s), et « point » n'est jamais prononcé
+    # (retranscription Whisper large-v3). Choix validé à l'écoute.
+    # Le remplacement par « ; » visait XTTS (retiré).
 
     # 10. Ponctuation doublée résiduelle
-    text = re.sub(r'([,;:!?])\s*\1+', r'\1', text)
+    text = re.sub(r'([.,;:!?])\s*\1+', r'\1', text)
 
     # 11. Espaces multiples
     text = re.sub(r'\s+', ' ', text).strip()
 
     # 12. S'assurer que le texte finit par une ponctuation (évite coupure abrupte)
-    if text and text[-1] not in '!?,;:':
-        text += ';'
+    if text and text[-1] not in '.!?,;:':
+        text += '.'
 
     return text
 
@@ -1399,7 +1390,7 @@ def _trim_tts_silence(audio_path, threshold_db=-40.0,
                       min_silence_ms=100, keep_ms=50):
     """
     Supprime le silence parasite en début et fin d'un clip TTS (in-place).
-    XTTS ajoute souvent 200-500ms de silence avant/après la voix, qui peut
+    Le TTS ajoute souvent 200-500ms de silence avant/après la voix, qui peut
     contenir des clics ou pops du décodeur.
 
     - threshold_db : seuil en dB sous lequel on considère comme silence
@@ -1472,7 +1463,7 @@ def pad_tts_audio(audio_path: str, tail_pad_ms: int = 200) -> str:
     """
     Ajoute du silence en fin de clip TTS pour éviter les mots coupés.
 
-    XTTS génère parfois un audio qui se termine pile sur le dernier
+    Le TTS génère parfois un audio qui se termine pile sur le dernier
     phonème sans silence résiduel. Ce padding garantit une marge.
 
     Détecte aussi les fins abruptes (énergie encore haute en fin de clip)
@@ -1511,7 +1502,7 @@ def pad_tts_audio(audio_path: str, tail_pad_ms: int = 200) -> str:
 
 # ── Découpage texte pour TTS ─────────────────────────────────────────────────
 
-def split_text_for_tts(text, max_chars=XTTS_CHAR_LIMIT_DEFAULT):
+def split_text_for_tts(text, max_chars=QWEN3TTS_MAX_CHARS):
     """
     Découpe un texte en morceaux de max_chars aux frontières naturelles.
     Priorité : phrase (. ! ?) > clause (, ; :) > espace > coupure brute.
@@ -1560,411 +1551,6 @@ def split_text_for_tts(text, max_chars=XTTS_CHAR_LIMIT_DEFAULT):
     return chunks
 
 
-# ── Voix preset XTTS v2 ──────────────────────────────────────────────────────
-
-XTTS_VOICES_FEMALE = [
-    "Ana Florence", "Brenda Stern", "Claribel Dervla", "Gracie Wise",
-    "Henriette Usha", "Sofia Hellen", "Tanja Adelina", "Alma María",
-    "Daisy Studious", "Gitta Nikolina", "Tamaru Naoko", "Lidiya Szekeres",
-]
-XTTS_VOICES_MALE = [
-    "Craig Gutsy", "Damien Black", "Viktor Menelaos", "Baldur Sanjin",
-    "Dionisio Schuyler", "Royston Min", "Abrahan Mack", "Gilberto Mathias",
-    "Kazuhiko Atallah", "Torcull Diarmuid", "Zacharie Aimilios", "Viktor Eka",
-]
-XTTS_DEFAULT_VOICES = [
-    "Craig Gutsy", "Ana Florence", "Damien Black", "Brenda Stern",
-    "Viktor Menelaos", "Claribel Dervla", "Baldur Sanjin", "Gracie Wise",
-]
-
-# Mapping langue → code XTTS
-XTTS_LANG_MAP = {
-    "fr": "fr", "en": "en", "es": "es", "de": "de", "it": "it",
-    "pt": "pt", "pl": "pl", "tr": "tr", "ru": "ru", "nl": "nl",
-    "cs": "cs", "ar": "ar", "zh": "zh", "ja": "ja", "ko": "ko",
-    "hu": "hu", "hi": "hi",
-}
-
-
-class XTTSBackend:
-    """Backend XTTS v2 pour synthèse vocale."""
-
-    def __init__(self, target_lang="fr", ref_voice=None, xtts_speaker=None):
-        from TTS.api import TTS as CoquiTTS
-        print("   🔊 Chargement du modèle XTTS v2...")
-        self.model = CoquiTTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
-        self.target_lang = XTTS_LANG_MAP.get(target_lang, target_lang)
-        self.profiles = {}
-        self.ref_voice = ref_voice
-        self.xtts_speaker = xtts_speaker
-        self.voice_map = {}
-        # Warm-up : les 1-2 premiers appels XTTS produisent souvent un audio
-        # dégradé (décodeur autorégressif pas encore stabilisé). On force
-        # 2 appels avec les mêmes paramètres que la synthèse réelle.
-        try:
-            import tempfile
-            warmup_path = os.path.join(tempfile.gettempdir(), "_xtts_warmup.wav")
-            warmup_kwargs = dict(
-                repetition_penalty=5.0, temperature=0.65,
-                length_penalty=1.0, top_k=50, top_p=0.85,
-                enable_text_splitting=False,
-            )
-            for warmup_text in [
-                "Bonjour, bienvenue dans cette présentation,",
-                "Nous allons maintenant commencer notre discussion,",
-            ]:
-                self.model.tts_to_file(
-                    text=warmup_text,
-                    speaker="Craig Gutsy",
-                    language=self.target_lang,
-                    file_path=warmup_path,
-                    **warmup_kwargs,
-                )
-            if os.path.exists(warmup_path):
-                os.remove(warmup_path)
-        except Exception:
-            pass  # ne pas bloquer si le warm-up échoue
-        print(f"   ✅ XTTS v2 prêt (langue cible: {self.target_lang})")
-
-    def setup_voices(self, profiles):
-        self.profiles = profiles
-        speakers = sorted(profiles.keys())
-
-        if self.ref_voice:
-            print(f"      🎯 Voix de référence externe : {self.ref_voice}")
-
-        if self.xtts_speaker:
-            for spk in speakers:
-                self.voice_map[spk] = self.xtts_speaker
-            print(f"      🎯 Voix preset '{self.xtts_speaker}' pour {len(speakers)} locuteur(s)")
-        else:
-            female_idx = male_idx = unknown_idx = 0
-            for spk in speakers:
-                p = profiles[spk]
-                has_ref = bool(p.ref_clips) or (p.sample_path and os.path.exists(p.sample_path))
-
-                if has_ref:
-                    ref_count = len(p.ref_clips) if p.ref_clips else 1
-                    print(f"      🎙️ {spk} : clonage vocal ({ref_count} refs, "
-                          f"{p.total_duration:.0f}s)")
-                else:
-                    gender = p.gender
-                    if gender == "female":
-                        voice = XTTS_VOICES_FEMALE[female_idx % len(XTTS_VOICES_FEMALE)]
-                        female_idx += 1
-                    elif gender == "male":
-                        voice = XTTS_VOICES_MALE[male_idx % len(XTTS_VOICES_MALE)]
-                        male_idx += 1
-                    else:
-                        voice = XTTS_DEFAULT_VOICES[unknown_idx % len(XTTS_DEFAULT_VOICES)]
-                        unknown_idx += 1
-                    self.voice_map[spk] = voice
-                    icon = "♀️" if gender == "female" else "♂️" if gender == "male" else "❓"
-                    print(f"      🎤 {spk} {icon} → preset \"{voice}\"")
-
-    def _get_best_ref(self, speaker_id):
-        if self.ref_voice:
-            return self.ref_voice
-        profile = self.profiles.get(speaker_id)
-        if not profile:
-            profile = next((p for p in self.profiles.values()
-                            if p.ref_clips or p.sample_path), None)
-        if not profile:
-            return ""
-        if profile.ref_clips:
-            return profile.ref_clips[0][0]
-        if profile.sample_path and os.path.exists(profile.sample_path):
-            return profile.sample_path
-        return ""
-
-    def synthesize(self, text, speaker_id, output_path):
-        """
-        Synthèse d'un segment avec découpage intelligent des textes longs.
-
-        Flux :
-        1. sanitize_for_tts() → nettoyage ponctuation
-        2. Si texte > char_limit → split_text_for_tts() + _synthesize_and_concat()
-           Sinon → _tts_one() directement
-        3. Anti-bégaiement :
-           - seuil_1 → retry agressif (_tts_one ou _synthesize_and_concat)
-           - seuil_2 → re-split en morceaux courts + _synthesize_and_concat
-           - dernier recours → troncature audio
-        4. --verify-tts → vérification ASR, re-split si échec
-        5. pad_tts_audio() → padding de fin
-        """
-        import soundfile as sf
-        import numpy as np
-
-        clean = sanitize_for_tts(text, self.target_lang)
-        if not clean:
-            return ""
-
-        char_limit = XTTS_CHAR_LIMITS.get(self.target_lang, XTTS_CHAR_LIMIT_DEFAULT)
-        preset_voice = self.voice_map.get(speaker_id)
-
-        ref_path = None
-        if not preset_voice:
-            ref_path = self._get_best_ref(speaker_id)
-            if not ref_path:
-                print(f"      ❌ Aucun échantillon pour {speaker_id}")
-                return ""
-
-        try:
-            # ── Étape 1 : synthèse initiale (avec split si nécessaire) ───
-            chunks = split_text_for_tts(clean, char_limit)
-            if len(chunks) > 1:
-                print(f"      📝 Texte long ({len(clean)} car.) découpé en {len(chunks)} morceaux")
-                ok = self._synthesize_and_concat(
-                    chunks, preset_voice, ref_path, output_path)
-                if not ok:
-                    print(f"      ❌ Échec synthèse multi-morceaux [{speaker_id}]")
-                    return ""
-            else:
-                self._tts_one(clean, preset_voice, ref_path, output_path)
-
-            # ── Étape 2 : anti-bégaiement ────────────────────────────────
-            audio, sr = sf.read(output_path)
-            if audio.ndim == 2:
-                audio = audio.mean(axis=1)
-            duration = len(audio) / sr
-            chars = len(clean)
-
-            SLOW_LANGS = {"fr", "es", "it", "pt", "de", "pl", "nl", "cs", "ro", "hu"}
-            if self.target_lang in SLOW_LANGS:
-                stutter_threshold_1 = 0.090   # 90ms/char → retry (relevé : 60 trop agressif
-                                              # pour texte mixte pali/sanskrit + langue cible)
-                stutter_threshold_2 = 0.130   # 130ms/char → re-split (vrai bégaiement seulement)
-            else:
-                stutter_threshold_1 = 0.075   # 75ms/char → retry
-                stutter_threshold_2 = 0.110   # 110ms/char → re-split
-
-            if chars > 10 and duration / chars > stutter_threshold_1:
-                ms_per_char = 1000 * duration / chars
-                print(f"      ⚠️  Bégaiement probable ({duration:.1f}s pour {chars} car., "
-                      f"{ms_per_char:.0f}ms/car) → retry agressif")
-
-                # Retry agressif (même découpage)
-                if len(chunks) > 1:
-                    self._synthesize_and_concat(
-                        chunks, preset_voice, ref_path, output_path,
-                        aggressive=True)
-                else:
-                    self._tts_one(clean, preset_voice, ref_path, output_path,
-                                  aggressive=True)
-
-                audio, sr = sf.read(output_path)
-                if audio.ndim == 2:
-                    audio = audio.mean(axis=1)
-                duration = len(audio) / sr
-
-                # Si toujours aberrant → re-split en morceaux courts
-                if chars > 10 and duration / chars > stutter_threshold_2:
-                    short_limit = max(char_limit // 2, 40)
-                    short_chunks = split_text_for_tts(clean, short_limit)
-
-                    if len(short_chunks) > 1:
-                        print(f"      🔄 Re-synthèse: {len(short_chunks)} morceaux "
-                              f"(limite {short_limit} car.)")
-                        ok = self._synthesize_and_concat(
-                            short_chunks, preset_voice, ref_path, output_path,
-                            aggressive=True)
-                        if ok:
-                            audio, sr = sf.read(output_path)
-                            if audio.ndim == 2:
-                                audio = audio.mean(axis=1)
-                            duration = len(audio) / sr
-
-                    # Info si toujours au-dessus du seuil (mais PAS de troncature —
-                    # la troncature détruisait le contenu, surtout sur texte mixte
-                    # pali/sanskrit + langue cible où le débit est naturellement lent)
-                    if duration / chars > stutter_threshold_2:
-                        ms_retry = 1000 * duration / chars
-                        print(f"      ℹ️  Débit toujours lent ({ms_retry:.0f}ms/car) — "
-                              f"accepté tel quel (pas de troncature)")
-
-            # ── Étape 3 : vérification ASR optionnelle ───────────────────
-            if not self._verify_tts_output(clean, output_path):
-                short_limit = max(char_limit // 2, 40)
-                short_chunks = split_text_for_tts(clean, short_limit)
-                if len(short_chunks) > 1:
-                    print(f"      🔄 Vérification ASR échouée → re-synthèse en "
-                          f"{len(short_chunks)} morceaux")
-                    self._synthesize_and_concat(
-                        short_chunks, preset_voice, ref_path, output_path,
-                        aggressive=True)
-
-            # Padding de fin (protège les derniers mots)
-            pad_tts_audio(output_path)
-            return output_path
-
-        except Exception as e:
-            print(f"      ❌ XTTS échoué [{speaker_id}] : {e}")
-            return ""
-
-    def _tts_one(self, text, preset_voice, ref_path, output_path,
-                 aggressive=False):
-        """Synthèse d'un seul segment de texte avec paramètres anti-bégaiement.
-
-        Paramètres XTTS passés via kwargs :
-        - repetition_penalty : pénalise le décodeur autorégressif quand il boucle
-          (valeur élevée = moins de répétitions/bégaiements)
-        - temperature : contrôle la variabilité de la génération
-          (plus bas = plus conservateur, moins de risque de boucle)
-        - length_penalty : contrôle la longueur de sortie
-        - top_k / top_p : paramètres d'échantillonnage
-
-        En mode aggressive (retry ou segment court) : repetition_penalty
-        et temperature plus stricts pour forcer le décodeur hors des boucles.
-        """
-        is_short = len(text) < 30
-        if aggressive or is_short:
-            xtts_kwargs = dict(
-                repetition_penalty=5.5,   # Pénalité forte mais pas extrême (9.0 causait
-                                          # des arrêts prématurés sur texte mixte pali/fr)
-                temperature=0.55,         # Conservateur mais laisse assez de marge pour
-                                          # que le décodeur ne choisisse pas "stop" trop tôt
-                length_penalty=1.0,
-                top_k=40,                 # Vocabulaire un peu plus ouvert
-                top_p=0.80,               # Noyau moins étroit
-                enable_text_splitting=False,  # Ne pas re-découper un texte déjà court
-            )
-        else:
-            xtts_kwargs = dict(
-                repetition_penalty=5.0,   # Fortement pénaliser les répétitions
-                temperature=0.65,         # Conservateur pour éviter les boucles
-                length_penalty=1.0,
-                top_k=50,
-                top_p=0.85,
-                enable_text_splitting=False,
-            )
-        if preset_voice:
-            self.model.tts_to_file(
-                text=text, speaker=preset_voice,
-                language=self.target_lang, file_path=output_path,
-                **xtts_kwargs,
-            )
-        else:
-            self.model.tts_to_file(
-                text=text, speaker_wav=ref_path,
-                language=self.target_lang, file_path=output_path,
-                **xtts_kwargs,
-            )
-
-    def _synthesize_and_concat(self, chunks, preset_voice, ref_path,
-                               output_path, aggressive=False, gap_ms=60):
-        """Synthétise chaque morceau dans un WAV temporaire puis concatène.
-
-        Les morceaux sont séparés par gap_ms millisecondes de silence pour
-        maintenir un rythme naturel entre les fragments.
-        """
-        import soundfile as sf
-        import numpy as np
-
-        tmp_dir = os.path.dirname(output_path) or "."
-        wav_parts = []
-        sr = None
-
-        for i, chunk in enumerate(chunks):
-            if not chunk.strip():
-                continue
-            tmp_path = os.path.join(tmp_dir, f"_chunk_{os.getpid()}_{i}.wav")
-            try:
-                self._tts_one(chunk, preset_voice, ref_path, tmp_path,
-                              aggressive=aggressive)
-                audio, file_sr = sf.read(tmp_path)
-                if audio.ndim == 2:
-                    audio = audio.mean(axis=1)
-                if sr is None:
-                    sr = file_sr
-                wav_parts.append(audio)
-            except Exception as e:
-                print(f"      ⚠️  Échec morceau {i+1}/{len(chunks)} : {e}")
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-
-        if not wav_parts or sr is None:
-            return False
-
-        # Concaténer avec micro-crossfade de 128 samples aux jonctions
-        crossfade_samples = min(128, min(len(p) for p in wav_parts) // 2) if wav_parts else 0
-        gap_samples = int(sr * gap_ms / 1000)
-        combined = []
-        for i, part in enumerate(wav_parts):
-            if i > 0:
-                # Crossfade : fade-out les derniers samples du chunk précédent,
-                # gap de silence, puis fade-in les premiers samples du chunk suivant
-                if crossfade_samples > 0 and len(combined) > 0:
-                    # Fade-out fin du chunk précédent
-                    prev = combined[-1]
-                    fade_out = np.linspace(1.0, 0.0, crossfade_samples).astype(prev.dtype)
-                    prev[-crossfade_samples:] *= fade_out
-                    combined[-1] = prev
-                    # Gap de silence
-                    combined.append(np.zeros(gap_samples, dtype=part.dtype))
-                    # Fade-in début du chunk suivant
-                    fade_in = np.linspace(0.0, 1.0, crossfade_samples).astype(part.dtype)
-                    part = part.copy()
-                    part[:crossfade_samples] *= fade_in
-                else:
-                    combined.append(np.zeros(gap_samples, dtype=part.dtype))
-            combined.append(part)
-
-        sf.write(output_path, np.concatenate(combined), sr)
-        return True
-
-    def _verify_tts_output(self, text, audio_path):
-        """Vérifie via ASR que le TTS a bien vocalisé tout le texte.
-
-        Charge WhisperX 'base' de manière paresseuse (1er appel uniquement).
-        Compare le nombre de mots ASR vs texte original.
-        Retourne True si >= 70% des mots sont détectés.
-        """
-        if not hasattr(self, 'verify_tts') or not self.verify_tts:
-            return True
-
-        try:
-            import whisperx
-            import torch
-
-            # Chargement paresseux du modèle ASR léger
-            if not hasattr(self, '_whisperx_model'):
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-                compute = "float16" if device == "cuda" else "int8"
-                print("      🔍 Chargement WhisperX base pour vérification TTS...")
-                self._whisperx_model = whisperx.load_model(
-                    "base", device, compute_type=compute)
-                self._whisperx_device = device
-
-            audio = whisperx.load_audio(audio_path)
-            result = self._whisperx_model.transcribe(
-                audio, batch_size=4, language=self.target_lang)
-
-            asr_text = " ".join(seg["text"] for seg in result.get("segments", []))
-            asr_words = len(asr_text.split())
-            expected_words = len(text.split())
-
-            if expected_words == 0:
-                return True
-
-            ratio = asr_words / expected_words
-            print(f"      🔍 ASR: {asr_words}/{expected_words} mots détectés ({ratio:.0%})")
-
-            return ratio >= 0.70
-
-        except Exception as e:
-            print(f"      ⚠️  Vérification ASR échouée : {e}")
-            return True  # ne pas bloquer en cas d'erreur
-
-    def cleanup(self):
-        if hasattr(self, '_whisperx_model'):
-            del self._whisperx_model
-        del self.model; gc.collect()
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-
 class Qwen3TTSBackend:
     """Backend Qwen3-TTS via subprocess bridge (env conda isolé).
 
@@ -2007,7 +1593,6 @@ class Qwen3TTSBackend:
         self.qwen_lang = QWEN3TTS_LANG_MAP.get(target_lang, "French")
         self.profiles = {}
         self.voice_map = {}
-        self.verify_tts = False
 
         device = resp.get("device", "?")
         mode_info = "x_vector_only (timbre seul, accent natif)" if self.cross_lang else "ICL (timbre + prosodie)"
@@ -2207,10 +1792,10 @@ def synthesize_segments(segments, profiles, tts, work_dir):
     """
     Synthétise UN clip TTS par segment de parole.
 
-    Chaque segment WhisperX est court → XTTS produit un audio propre
+    Chaque segment WhisperX est court → le TTS produit un audio propre
     sans besoin de découpage ou de crossfade.
     """
-    print(f"\n🗣️  Passe 5 — Synthèse vocale par segments (XTTS v2)...")
+    print(f"\n🗣️  Passe 5 — Synthèse vocale par segments...")
 
     tts.setup_voices(profiles)
 
@@ -2761,19 +2346,10 @@ def process_one_file(input_path: str, args, claude_client, tts_backend=None,
             # Ollama ne libère pas la VRAM assez vite : on décharge tout modèle
             # résident ET on VÉRIFIE qu'elle est libre avant de charger le TTS.
             free_gpu_for_task(min_free_mib=6000, timeout=60)
-        model_choice = getattr(args, 'model', 'qwen3tts')
-        if model_choice == "qwen3tts":
-            tts_backend = Qwen3TTSBackend(
-                target_lang=tgt_lang,
-                source_lang=src_lang,
-            )
-        else:
-            tts_backend = XTTSBackend(
-                target_lang=tgt_lang,
-                ref_voice=getattr(args, 'ref_voice', None),
-                xtts_speaker=getattr(args, 'xtts_speaker', None),
-            )
-        tts_backend.verify_tts = getattr(args, 'verify_tts', False)
+        tts_backend = Qwen3TTSBackend(
+            target_lang=tgt_lang,
+            source_lang=src_lang,
+        )
 
     try:
         segments = synthesize_segments(segments, profiles, tts_backend, work_dir)
@@ -2821,7 +2397,7 @@ def main():
     global WHISPER_MODEL, CLAUDE_MODEL
 
     p = argparse.ArgumentParser(
-        description="Traduction vocale IA — batch MP3/MP4 → MP3 traduit (Qwen3-TTS / XTTS v2)",
+        description="Traduction vocale IA — batch MP3/MP4 → MP3 traduit (Qwen3-TTS)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Exemples :
@@ -2829,13 +2405,9 @@ def main():
               python doubler-mp3-batch.py -s en -t es                        # EN → ES
               python doubler-mp3-batch.py --file podcast.mp3                 # un seul MP3
               python doubler-mp3-batch.py --file interview.mp4               # un seul MP4
-              python doubler-mp3-batch.py --xtts-speaker "Craig Gutsy"       # voix preset XTTS
-              python doubler-mp3-batch.py --model xtts --file test.mp3       # backend XTTS v2
-              python doubler-mp3-batch.py --ref-voice ma_voix.wav            # voix de référence
               python doubler-mp3-batch.py --speakers 1                       # monologue
               python doubler-mp3-batch.py --pause 1000 --speaker-pause 1500  # pauses longues
               python doubler-mp3-batch.py --context "podcast tech décontracté"
-              python doubler-mp3-batch.py --list-xtts-speakers               # lister voix XTTS
         """))
 
     p.add_argument("--file", metavar="FILE",
@@ -2844,14 +2416,7 @@ def main():
                    help="Langue source (code ISO 639-1, défaut: en)")
     p.add_argument("-t", "--target-lang", default="fr",
                    help="Langue cible (code ISO 639-1, défaut: fr)")
-    p.add_argument("--ref-voice", metavar="WAV",
-                   help="Audio de référence pour le clonage vocal (10-15s)")
-    p.add_argument("--xtts-speaker", metavar="NAME",
-                   help="Voix preset XTTS v2 (ex: 'Craig Gutsy'). "
-                        "Liste : --list-xtts-speakers")
-    p.add_argument("--list-xtts-speakers", action="store_true",
-                   help="Lister les voix preset XTTS v2 et quitter")
-    p.add_argument("--model", choices=["qwen3tts", "xtts"], default="qwen3tts",
+    p.add_argument("--model", choices=["qwen3tts"], default="qwen3tts",
                    help="Backend TTS à utiliser (défaut: qwen3tts)")
     p.add_argument("--segments", metavar="JSON",
                    help="Reprendre depuis un fichier segments existant")
@@ -2867,9 +2432,6 @@ def main():
                    help="Passer la relecture de traduction (passe 4c)")
     p.add_argument("--skip-checks", action="store_true",
                    help="Passer la vérification des dépendances")
-    p.add_argument("--verify-tts", action="store_true",
-                   help="Vérifier chaque sortie TTS par ASR (WhisperX base) — "
-                        "re-synthétise si <70%% des mots détectés")
     p.add_argument("--context", type=str, default="",
                    help="Contexte pour guider la traduction (noms, sujet, registre...)")
     p.add_argument("--whisper-model", default=WHISPER_MODEL)
@@ -2886,20 +2448,6 @@ def main():
     p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
     args = p.parse_args()
 
-    # ── Liste des voix ──────────────────────────────────────────────────
-    if args.list_xtts_speakers:
-        print("\n🎤 Voix preset XTTS v2")
-        print("=" * 55)
-        print("\n   ♀️  Voix féminines :")
-        for v in XTTS_VOICES_FEMALE:
-            print(f"      • {v}")
-        print("\n   ♂️  Voix masculines :")
-        for v in XTTS_VOICES_MALE:
-            print(f"      • {v}")
-        print(f"\n   Total : {len(XTTS_VOICES_FEMALE) + len(XTTS_VOICES_MALE)} voix")
-        print(f"\n   Usage : --xtts-speaker \"Craig Gutsy\"\n")
-        sys.exit(0)
-
     src_lang = args.source_lang.lower()
     tgt_lang = args.target_lang.lower()
 
@@ -2912,9 +2460,6 @@ def main():
         print(f"❌ Qwen3-TTS ne supporte pas la langue cible '{tgt_lang}'.")
         print(f"   Langues supportées : {langs}")
         sys.exit(1)
-
-    if args.xtts_speaker and args.model != "xtts":
-        print(f"⚠️  --xtts-speaker ignoré (backend actif : {args.model})")
 
     WHISPER_MODEL = args.whisper_model
     CLAUDE_MODEL = args.claude_model

@@ -77,14 +77,17 @@ WHISPER_MODEL = "large-v3"
 WHISPER_BATCH_SIZE = 16
 WHISPER_COMPUTE_TYPE = "float16"
 
-CLAUDE_MODEL = "claude-opus-4-5"  # 2026-06-16 : claude-sonnet-4-20250514 retiré le
+CLAUDE_MODEL = "claude-opus-5"  # 2026-06-16 : claude-sonnet-4-20250514 retiré le
 # 15/06/2026 (404 not_found). On évite sonnet-4-6 (cf. A/B 2026-05-25 : doublons
 # synonymiques « fléaux et épidémies » pour « Seuchen », étoffements et paraphrases
 # malgré les règles explicites du prompt). Opus 4.5 : meilleur suivi d'instructions,
 # traduction concise plus fidèle sur les sous-titres.
+# 2026-09-20 : passage à Opus 5 (Opus 4.5 sera retiré ; tool_choice forcé vérifié).
+# L'A/B de style du 25/05 n'a PAS été refait sur Opus 5 : à revalider à la relecture.
 CLAUDE_MAX_TOKENS = 8192
-CLAUDE_RETRY_MAX = 5
+CLAUDE_RETRY_MAX = 10
 CLAUDE_RETRY_DELAY = 10.0              # délai initial en secondes (backoff exponentiel)
+CLAUDE_RETRY_DELAY_MAX = 120.0         # plafond du backoff (un épisode 529 Overloaded peut durer plusieurs minutes)
 
 # Ollama (LLM local — alternative gratuite à l'API Claude)
 OLLAMA_URL = "http://localhost:11434"
@@ -94,10 +97,19 @@ OLLAMA_NUM_PREDICT = 16384             # marge large (tokens réflexion Qwen3 in
 # Contraintes de sous-titrage (normes professionnelles)
 MAX_CHARS_PER_LINE = 42
 MAX_LINES_PER_SUB = 2
-MAX_CPS = 17                  # Caractères/seconde (lecture confortable)
+MAX_CPS = 17                  # Caractères/seconde (lecture confortable — cible)
+CPS_HARD = 25                 # au-delà : vraiment difficile à lire (25-30), fortement pénalisé
 MIN_DURATION_SEC = 1.0
 MAX_DURATION_SEC = 7.0
+MAX_DURATION_HARD_SEC = 8.5   # au-delà : coupure obligatoire (7-8,5 s = toléré avec pénalité)
 GAP_BETWEEN_SUBS_MS = 80
+# Regroupement syntaxique (cf. retour relecteur humain 2026-09-14, « Über das Märchen ») :
+# les sous-titres suivent les groupes de sens, pas le découpage WhisperX de l'audio source.
+GROUP_MAX_GAP_SEC = 0.6        # silence maximal entre 2 segments pour les regrouper dans un même sous-titre
+SUB_BASE_COST = 5.0            # coût fixe par sous-titre → favorise les regroupements
+SHORT_SUB_CHARS = 25           # en dessous : sous-titre « fragment », pénalisé
+SNAP_PAUSE_WINDOW_SEC = 0.45   # une coupure est recalée sur une pause audio si elle est à moins de 0,45 s
+SNAP_PAUSE_MIN_SEC = 0.20      # durée minimale d'une pause pour servir d'ancrage
 PAUSE_SPLIT_THRESHOLD = 1.5    # silence interne (s) déclenchant le découpage d'un segment
 PAUSE_SPLIT_PADDING = 0.35     # padding lecture (s) appliqué à la fin de chaque sous-segment
 
@@ -243,7 +255,13 @@ def _claude_create(client, **kwargs):
     is_local = isinstance(client, _OllamaClient)
     for attempt in range(1, CLAUDE_RETRY_MAX + 1):
         try:
-            return client.messages.create(**kwargs)
+            resp = client.messages.create(**kwargs)
+            if not is_local:
+                # Opus 5 pense par défaut : les blocs thinking précèdent le texte.
+                # On les retire pour que resp.content[0] reste le texte / tool_use.
+                resp.content = [b for b in resp.content
+                                if b.type not in ("thinking", "redacted_thinking")]
+            return resp
         except Exception as exc:
             retryable = False
             if is_local:
@@ -256,7 +274,7 @@ def _claude_create(client, **kwargs):
                 elif isinstance(exc, anthropic.APIConnectionError):
                     retryable = True
             if retryable and attempt < CLAUDE_RETRY_MAX:
-                delay = CLAUDE_RETRY_DELAY * (2 ** (attempt - 1))
+                delay = min(CLAUDE_RETRY_DELAY * (2 ** (attempt - 1)), CLAUDE_RETRY_DELAY_MAX)
                 label = "Ollama" if is_local else "API Claude"
                 print(f"   ⏳ {label} erreur ({type(exc).__name__}), retry {attempt}/{CLAUDE_RETRY_MAX} dans {delay:.0f}s...")
                 time.sleep(delay)
@@ -528,7 +546,10 @@ ORPHAN_WORDS = {
     "fr": {"le", "la", "les", "l", "un", "une", "des", "du", "de", "d", "au", "aux",
            "ce", "cet", "cette", "ces", "mon", "ma", "mes", "ton", "ta", "tes",
            "son", "sa", "ses", "notre", "nos", "votre", "vos", "leur", "leurs",
-           "à", "en", "et", "ou", "ne", "se", "je", "tu", "il", "on", "nous", "vous", "ils", "elles"},
+           "à", "en", "et", "ou", "ne", "se", "je", "tu", "il", "on", "nous", "vous", "ils", "elles",
+           "que", "qu", "qui", "dont", "où", "sur", "dans", "pour", "par", "avec", "sans", "chez",
+           "vers", "mais", "car", "donc", "ni", "si", "comme", "quand", "lorsque", "puisque",
+           "dès", "depuis", "entre", "sous", "contre", "parmi", "malgré", "selon"},
     "en": {"the", "a", "an", "my", "your", "his", "her", "its", "our", "their",
            "this", "that", "these", "those", "to", "of", "in", "on", "and", "or",
            "is", "it", "he", "she", "we", "they", "i"},
@@ -540,6 +561,22 @@ ORPHAN_WORDS = {
            "dei", "delle", "in", "e", "o", "si", "mi", "ti", "ci", "vi", "ne"},
     "pt": {"o", "a", "os", "as", "um", "uma", "uns", "umas", "de", "do", "da",
            "dos", "das", "em", "e", "ou", "se", "me", "te", "nos"},
+}
+
+# Mots qu'on évite en FIN DE LIGNE 1 (auxiliaires, copules, négation, adverbes de degré) :
+# ils ouvrent un groupe verbal ou adjectival — « Quand quelque chose est | annoncé » est
+# une coupure au milieu d'un syntagme. Pénalité modérée (pas une interdiction).
+WEAK_LINE_END = {
+    "fr": {"est", "sont", "a", "ont", "été", "être", "avoir", "suis", "es", "sommes", "êtes",
+           "ai", "as", "avons", "avez", "sera", "serait", "seront", "ne", "n", "très", "trop",
+           "aussi", "même", "tout", "toute", "tous", "toutes", "plus", "moins", "y"},
+    "en": {"is", "are", "was", "were", "be", "been", "have", "has", "had", "do", "does", "did",
+           "will", "would", "can", "could", "should", "must", "not", "very", "so", "too", "also"},
+    "de": {"ist", "sind", "war", "waren", "hat", "haben", "wird", "werden", "kann", "können",
+           "muss", "müssen", "nicht", "sehr", "auch", "noch", "schon"},
+    "es": {"es", "son", "está", "están", "ha", "han", "fue", "no", "muy", "también", "ya"},
+    "it": {"è", "sono", "era", "ha", "hanno", "non", "molto", "anche", "già"},
+    "pt": {"é", "são", "está", "estão", "foi", "não", "muito", "também", "já"},
 }
 
 # Longueur minimale d'un sous-titre (en caractères) pour éviter les sous-titres trop courts
@@ -1510,7 +1547,9 @@ RÈGLES :
 5. Respecte le glossaire pour toute terminologie
 6. SOUS-TITRAGE : vise ≤84 caractères par réplique et un débit ≤17 car/s.
    Ce sont des guides de concision, pas des limites dures ; privilégie toujours
-   la clarté et le naturel, mais évite les formulations inutilement longues
+   la clarté et le naturel, mais évite les formulations inutilement longues.
+   Un sous-titre humain de qualité est en général 5 à 10 % plus court qu'une
+   traduction « pleine » : chaque mot qui ne porte rien doit sauter
 7. Correspondance 1:1 stricte des numéros — ne JAMAIS fusionner
 8. Ne traduis QUE les segments "À TRADUIRE", pas le contexte
 9. Style oral naturel, pas littéraire
@@ -1531,6 +1570,25 @@ RÈGLES :
     dit la source (interdit : ajouter « de l'histoire », « bien sûr »,
     « comme on le sait » si ce n'est pas dans le source). La traduction
     doit avoir la même densité informationnelle que l'original.
+14. VOIX ACTIVE : préfère l'actif au passif quand la langue cible le permet
+    (« le Covid a révélé des mécanismes » plutôt que « des mécanismes ont
+    été révélés »).
+15. TOURNURES LÉGÈRES : évite l'empilement de subordonnées (« que… qui…
+    que… ») quand un infinitif, un nom ou une tournure directe fait
+    l'affaire (« Pas besoin de consulter la Constitution » plutôt que
+    « Il n'est même pas nécessaire de consulter la Constitution »). À
+    l'oral, un « nous/on » générique se rend de préférence par « on ».
+16. RÉPÉTITIONS : une désignation longue (titre + nom, nom complet d'une
+    organisation ou d'une initiative) s'écrit en entier à sa PREMIÈRE
+    occurrence, puis sous forme courte : nom seul, « cette initiative »,
+    pronom (« le patron de Ringier, Marc Walder » puis « Walder »). Varie
+    les énumérateurs (« tout d'abord… ensuite… enfin » plutôt que
+    « première facette… deuxième facette… troisième facette »).
+17. IDIOMES : préfère l'expression consacrée à la paraphrase (« prendre
+    pour argent comptant » plutôt que « accepter d'abord comme un fait »).
+18. DATES : écris les années en entier. Une année abrégée à l'oral
+    (« März 20 », « in '19 », « back in 08 ») devient « mars 2020 »,
+    « en 2019 », « en 2008 » d'après le contexte.
 
 CHANTS, PRIÈRES ET PASSAGES RITUELS :
 Si un segment est un chant, une prière, un mantra, une récitation ou un texte
@@ -1891,6 +1949,14 @@ Critères de relecture (par ordre de priorité) :
    (« les grands épidémies » → « les grandes épidémies »).
 10. PAS D'ÉTOFFEMENT : retirer tout ajout contextuel absent de la source
     (« de l'histoire », « comme on sait », « bien sûr » ajoutés ad libitum).
+11. ALLÈGEMENT (retour d'un relecteur humain) : passif → actif quand c'est
+    naturel ; subordonnées en « que » → infinitif/nom/tournure directe ;
+    désignation longue répétée (titre + nom, nom complet d'une organisation)
+    → forme courte dès la 2e occurrence (nom seul, « cette initiative »,
+    pronom) ; énumérateurs variés (« tout d'abord… ensuite… enfin ») ;
+    expression consacrée plutôt que paraphrase (« prendre pour argent
+    comptant »). Ne corrige que si la phrase y gagne réellement.
+12. DATES : années en entier (« mars 20 » à l'oral → « mars 2020 »).
 
 SORTIE — appelle l'outil submit_texts avec un item UNIQUEMENT pour les
 segments à corriger ({{id: numéro, text: nouvelle_traduction}}).
@@ -2451,6 +2517,331 @@ def _split_on_pauses(segments: list[Segment]) -> list[Segment]:
     return result
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REGROUPEMENT SYNTAXIQUE OPTIMAL (programmation dynamique)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Retour du relecteur humain (« Über das Märchen der Medien », 2026-09-14) :
+#   - la version IA suivait le découpage temporel de l'audio allemand → coupures
+#     au milieu des syntagmes, fragments isolés d'un mot, ponctuation en début de
+#     ligne ;
+#   - la version humaine regroupe par groupes syntaxiques naturels (virgule, fin
+#     de proposition) et équilibre la longueur des sous-titres (269 sous-titres
+#     au lieu de 344 pour le même texte).
+# Ici, chaque bloc de parole continue est traité comme un texte cible unique
+# dont on choisit les coupures par programmation dynamique.
+
+# Mots devant lesquels une coupure est acceptable (conjonctions/relatifs)
+CUT_BEFORE_WORDS = {
+    "fr": {"et", "mais", "ou", "car", "donc", "puis", "alors", "parce", "puisque",
+           "quand", "lorsque", "si", "que", "qui", "dont", "où", "comme", "tandis",
+           "afin", "pour", "sans", "avant", "après", "pendant", "malgré", "selon"},
+    "en": {"and", "but", "or", "so", "then", "because", "when", "if", "that", "which",
+           "who", "while", "although", "since", "as", "after", "before", "unless"},
+    "es": {"y", "pero", "o", "porque", "cuando", "si", "que", "quien", "aunque",
+           "donde", "mientras", "como", "para", "sin"},
+    "de": {"und", "aber", "oder", "denn", "weil", "wenn", "dass", "als", "ob",
+           "sondern", "obwohl", "während", "damit", "bevor", "nachdem"},
+    "it": {"e", "ma", "o", "perché", "quando", "se", "che", "cui", "anche", "però",
+           "mentre", "come", "per", "senza"},
+    "pt": {"e", "mas", "ou", "porque", "quando", "se", "que", "quem", "embora",
+           "porém", "enquanto", "como", "para", "sem"},
+}
+
+# Ponctuation qui, en typographie française, est précédée d'une espace :
+# on ne coupe jamais sur cette espace (sinon « ; la perspective » en début de ligne).
+_NO_CUT_BEFORE = set(';:!?»…%')
+_NO_CUT_AFTER = set('«(')
+
+
+_PREP_WORDS_CACHE: dict = {}
+
+# Modaux/semi-auxiliaires : on évite de FINIR un sous-titre dessus (« peut | coûter »)
+MODAL_WORDS = {
+    "fr": {"peut", "peuvent", "pouvez", "pouvons", "doit", "doivent", "devez", "devons", "va",
+           "vont", "vais", "allez", "faut", "veut", "veulent", "voulez", "sait", "savent"},
+    "en": {"can", "could", "will", "would", "should", "must", "may", "might", "shall"},
+    "de": {"kann", "können", "muss", "müssen", "will", "wollen", "soll", "sollen", "darf"},
+}
+
+
+def _tok(word: str) -> str:
+    """Normalise un mot pour les tests de mot-outil : minuscules, sans ponctuation
+    ni guillemets, et pour les élisions on garde la partie après l'apostrophe
+    (« d'un » → « un », « qu'il » → « il », « l'État » → « état »)."""
+    w = word.lower().strip('«»"()[],.;:!?…')
+    if "'" in w or "’" in w:
+        w = re.split(r"['’]", w)[-1] or w
+    return w
+
+
+def _is_name_pair(w1: str, w2: str) -> bool:
+    """« Wim | Hof », « Eddie | Chang » : deux mots capitalisés consécutifs (hors
+    début de phrase) forment probablement un nom propre — ne pas couper entre eux."""
+    a = w1.strip('«»"()[]'); b = w2.strip('«»"()[]')
+    return (len(a) > 1 and len(b) > 1 and a[0].isupper() and b[0].isupper()
+            and not a.endswith(('.', '!', '?', '…', ',', ';', ':')))
+
+def _prep_words(target_lang: str) -> set:
+    """Prépositions de SPLIT_PATTERNS[lang]['prepositions'] sous forme d'ensemble de mots."""
+    if target_lang not in _PREP_WORDS_CACHE:
+        pat = SPLIT_PATTERNS.get(target_lang, {}).get("prepositions", "")
+        m = re.search(r'\(\?:(.*?)\)', pat)
+        _PREP_WORDS_CACHE[target_lang] = set(m.group(1).split('|')) if m else set()
+    return _PREP_WORDS_CACHE[target_lang]
+
+
+def _sentence_end(txt: str) -> bool:
+    return bool(re.search(r'[.!?…]["»)]?$', txt.strip()))
+
+
+def _cut_cost(T: str, j: int, target_lang: str) -> float:
+    """Coût d'une coupure sur l'espace T[j] (T[:j] | T[j+1:]). +inf = interdite."""
+    if j <= 0 or j >= len(T) - 1 or T[j] != ' ':
+        return float('inf')
+    prev_ch, next_ch = T[j-1], T[j+1]
+    if next_ch in _NO_CUT_BEFORE or prev_ch in _NO_CUT_AFTER:
+        return float('inf')
+    orphans = ORPHAN_WORDS.get(target_lang, set())
+    conj = CUT_BEFORE_WORDS.get(target_lang, set())
+    preps = _prep_words(target_lang)
+
+    before = T[:j].rstrip()
+    after = T[j+1:].lstrip()
+    last_word = before.split()[-1] if before.split() else ""
+    last_clean = _tok(last_word)
+    first_word = after.split()[0] if after.split() else ""
+    first_clean = _tok(first_word)
+
+    # Ponctuation forte / moyenne / faible
+    tail = last_word.rstrip('»")')
+    if tail.endswith(('.', '!', '?', '…')):
+        cost = 0.0
+    elif tail.endswith((';', ':', '—', '–')):
+        cost = 1.0
+    elif tail.endswith(','):
+        cost = 2.0
+    elif first_clean in conj:
+        cost = 4.0                    # couper AVANT la conjonction : acceptable
+    elif first_clean in preps:
+        cost = 9.0                    # couper avant une préposition : syntagme brisé
+    else:
+        cost = 8.0                    # espace quelconque
+    # Orphelin en fin de sous-titre (article, pronom, « et »…) : quasi interdit
+    if last_clean in orphans:
+        cost += 25.0
+    elif last_clean in WEAK_LINE_END.get(target_lang, set()) or last_clean in MODAL_WORDS.get(target_lang, set()):
+        cost += 6.0                   # « a été | réalisé », « peut | coûter » : groupe verbal brisé
+    elif cost >= 8.0 and len(before.split()) >= 2 and _tok(before.split()[-2]) in orphans:
+        cost += 6.0                   # « une bonne | partie » : groupe nominal brisé
+    if _is_name_pair(last_word, first_word):
+        cost += 8.0                   # « Wim | Hof »
+    return cost
+
+
+def _sub_cost(text: str, dur: float, target_lang: str, starts_sentence: bool = True) -> float:
+    """Coût intrinsèque d'un sous-titre candidat (+inf = impossible).
+    `dur` : durée audio du texte ; `starts_sentence` : le sous-titre commence
+    en début de phrase (coupure précédente sur ponctuation forte ou début de bloc)."""
+    L = len(text)
+    max_chars = MAX_CHARS_PER_LINE * MAX_LINES_PER_SUB
+    if L > max_chars or dur > MAX_DURATION_HARD_SEC:
+        return float('inf')
+    cost = SUB_BASE_COST
+    # Un sous-titre court peut « emprunter » jusqu'à 0,5 s au suivant (cf. post-traitement)
+    dur_eff = max(dur, min(MIN_DURATION_SEC, dur + 0.6))
+    if dur_eff < MIN_DURATION_SEC:
+        cost += 30.0 * (MIN_DURATION_SEC - dur_eff) / MIN_DURATION_SEC + 10.0
+    if L < SHORT_SUB_CHARS:
+        cost += 5.0 + (8.0 if L < 15 else 0.0)
+    # Débit : contrainte SOUPLE, mesurée en secondes de lecture manquantes (pas en
+    # ratio CPS, qui explose sur les phrases courtes que le relecteur humain garde
+    # volontiers seules). L'audit final étire les timings dans les silences voisins.
+    # Débit de lecture (calibrage utilisateur 2026-09-14) : jusqu'à ~24 CPS ça reste
+    # lisible pour la plupart des lecteurs, c'est entre 25 et 30 que ça devient
+    # vraiment difficile. Donc : coût modéré au-delà de MAX_CPS (cible), coût fort
+    # au-delà de CPS_HARD — mesurés en secondes de lecture manquantes.
+    deficit = L / MAX_CPS - dur_eff
+    if deficit > 0:
+        cost += deficit * 4.0
+    deficit_hard = L / CPS_HARD - dur_eff
+    if deficit_hard > 0:
+        cost += deficit_hard * 20.0
+    if dur > MAX_DURATION_SEC:
+        cost += (dur - MAX_DURATION_SEC) * 4.0
+    # Fin(s) de phrase à l'intérieur du sous-titre :
+    #  - sous-titre aligné sur des phrases complètes (deux phrases courtes réunies) : léger malus
+    #  - sinon (fin de phrase suivie d'un début de phrase tronqué) : fort malus — c'est
+    #    exactement la « coupure au milieu d'un syntagme » reprochée par le relecteur
+    n_inner = len(re.findall(r'[.!?…]["»]?\s+\S', text))
+    if n_inner:
+        aligned = starts_sentence and _sentence_end(text)
+        cost += (2.0 if aligned else 20.0) * n_inner
+    # Mise en forme sur 2 lignes
+    if L > MAX_CHARS_PER_LINE:
+        fmt = _fmtlines(text, target_lang)
+        lines = fmt.split('\n')
+        if any(len(l) > MAX_CHARS_PER_LINE for l in lines):
+            cost += 10.0
+        if len(lines) > 1:
+            cost += _line_break_cost(lines[0], lines[1], target_lang)
+    return cost
+
+
+def _line_break_cost(l1: str, l2: str, target_lang: str) -> float:
+    """Qualité du retour à la ligne l1 | l2 (0 = coupure sur ponctuation ou avant un
+    mot-outil ; plus c'est élevé, plus la coupure brise un syntagme)."""
+    w1 = l1.split(); w2 = l2.split()
+    if not w1 or not w2: return 0.0
+    last = w1[-1]; last_clean = _tok(last)
+    first_clean = _tok(w2[0])
+    if last.rstrip('»")').endswith(('.', '!', '?', '…', ',', ';', ':', '—', '–')):
+        cost = 0.0
+    elif first_clean in CUT_BEFORE_WORDS.get(target_lang, set()) or first_clean in _prep_words(target_lang):
+        cost = 1.0
+    else:
+        cost = 4.0                # espace quelconque
+    if last_clean in ORPHAN_WORDS.get(target_lang, set()):
+        cost += 15.0              # « un peu de | patience » : reproche explicite du relecteur
+    elif last_clean in WEAK_LINE_END.get(target_lang, set()):
+        cost += 4.0               # « quelque chose est | annoncé »
+    elif cost >= 4.0 and len(w1) >= 2 and _tok(w1[-2]) in ORPHAN_WORDS.get(target_lang, set()):
+        cost += 4.0               # « une bonne | partie » : groupe nominal brisé
+    if _is_name_pair(last, w2[0]):
+        cost += 8.0
+    return cost
+
+
+def _regroup_optimal(segments: list[Segment], target_lang: str = "fr") -> list[Subtitle]:
+    """Regroupe les segments contigus en blocs et choisit les coupures optimales."""
+    gap = GAP_BETWEEN_SUBS_MS / 1000
+    segs = [s for s in segments if s.text_tgt and s.text_tgt.strip() and s.end > s.start]
+
+    # ── Blocs de parole continue ──
+    # Une interjection brève et autonome (« D'accord. », « Pourquoi ? ») entre deux
+    # répliques longues vient presque toujours de l'AUTRE locuteur : on ne la fusionne
+    # jamais avec ses voisines (elle recevra sa durée minimale par emprunt).
+    def _is_interjection(i: int) -> bool:
+        s = segs[i]; t = s.text_tgt.strip()
+        if len(t) > 15 or not _sentence_end(t) or t.endswith(('...', '…')): return False
+        if not t[0].isupper() or s.end - s.start > 1.5: return False
+        prev_len = len(segs[i-1].text_tgt.strip()) if i > 0 else 0
+        next_len = len(segs[i+1].text_tgt.strip()) if i + 1 < len(segs) else 0
+        return prev_len > 30 and next_len > 30
+    groups, cur = [], []
+    for i, s in enumerate(segs):
+        alone = _is_interjection(i)
+        if cur and (alone or s.start - cur[-1].end > GROUP_MAX_GAP_SEC
+                    or (len(cur) == 1 and _is_interjection(i - 1))):
+            groups.append(cur); cur = []
+        cur.append(s)
+    if cur: groups.append(cur)
+
+    subs, idx = [], 1
+    n_merged_across = 0
+    for grp in groups:
+        # Texte concaténé + carte caractère→temps par segment
+        T, spans = "", []          # spans : (c0, c1, seg)
+        for s in grp:
+            t = ' '.join(s.text_tgt.split())
+            if T: T += ' '
+            c0 = len(T); T += t; spans.append((c0, len(T), s))
+
+        snapped: set = set()       # positions de coupure recalées sur une vraie pause audio
+
+        def time_at(c: float, side: str) -> float:
+            """Temps du caractère c ; side='end' → fin du sous-titre, 'start' → début."""
+            # Frontière exacte entre 2 segments : on suit la frontière audio
+            for si, (c0, c1, s) in enumerate(spans):
+                if side == 'end' and c == c1: return s.end
+                if side == 'start' and si > 0 and c == c0 - 1: return s.start
+            for c0, c1, s in spans:
+                if c0 <= c <= c1:
+                    if c1 == c0: return s.start
+                    t = s.start + (c - c0) / (c1 - c0) * (s.end - s.start)
+                    # Recalage sur une pause audio proche (mots alignés)
+                    words = [w for w in (s.words or []) if isinstance(w, dict) and 'start' in w and 'end' in w]
+                    best = None
+                    for a, b in zip(words, words[1:]):
+                        if b['start'] - a['end'] >= SNAP_PAUSE_MIN_SEC:
+                            mid = (a['end'] + b['start']) / 2
+                            if abs(mid - t) <= SNAP_PAUSE_WINDOW_SEC and (best is None or abs(mid - t) < abs(best[0] - t)):
+                                best = (mid, a['end'], b['start'])
+                    if best:
+                        if best[2] - best[1] >= 0.3: snapped.add(int(c))
+                        return best[1] if side == 'end' else best[2]
+                    return t - gap / 2 if side == 'end' else t + gap / 2
+            return grp[-1].end if side == 'end' else grp[0].start
+
+        # Positions de coupure candidates (espaces) + bornes
+        cand = [j for j, ch in enumerate(T) if ch == ' ']
+        P = [0] + cand + [len(T)]
+        n = len(P)
+        INF = float('inf')
+        dp = [INF] * n; back = [-1] * n; dp[0] = 0.0
+        for i in range(1, n):
+            end_c = P[i]
+            t_end = time_at(end_c, 'end') if i < n - 1 else grp[-1].end
+            ccost = 0.0 if i == n - 1 else _cut_cost(T, end_c, target_lang)
+            if ccost == INF: continue
+            if i < n - 1 and end_c in snapped and ccost >= 4.0:
+                ccost -= 3.0       # la coupure tombe sur une pause du locuteur : frontière prosodique
+            for k in range(i - 1, -1, -1):
+                if dp[k] == INF: continue
+                st_c = P[k] + (1 if k > 0 else 0)
+                text = T[st_c:end_c].strip()
+                if len(text) > MAX_CHARS_PER_LINE * MAX_LINES_PER_SUB: break
+                t_st = time_at(st_c - (1 if k > 0 else 0), 'start') if k > 0 else grp[0].start
+                dur = t_end - t_st
+                if dur > MAX_DURATION_HARD_SEC and k < i - 1: break
+                starts_sentence = (k == 0) or _sentence_end(T[:P[k]])
+                c = dp[k] + _sub_cost(text, max(dur, 0.05), target_lang, starts_sentence) + ccost
+                if c < dp[i]:
+                    dp[i] = c; back[i] = k
+        if dp[n-1] == INF:
+            # Ne devrait pas arriver (coupure sur chaque espace toujours possible) : repli 1 seg = 1 sous-titre
+            for s in grp:
+                subs.append(Subtitle(idx, s.start, s.end, _fmtlines(s.text_tgt, target_lang))); idx += 1
+            continue
+        cuts = []
+        i = n - 1
+        while i > 0:
+            cuts.append(i); i = back[i]
+        cuts.reverse()
+        prev_k = 0
+        for i in cuts:
+            st_c = P[prev_k] + (1 if prev_k > 0 else 0)
+            end_c = P[i]
+            text = T[st_c:end_c].strip()
+            t_st = grp[0].start if prev_k == 0 else time_at(P[prev_k], 'start')
+            t_end = grp[-1].end if i == n - 1 else time_at(end_c, 'end')
+            # Le sous-titre chevauche-t-il plusieurs segments source ?
+            n_src = sum(1 for c0, c1, _ in spans if c0 < end_c and c1 > st_c)
+            if n_src > 1: n_merged_across += 1
+            if t_end <= t_st: t_end = t_st + MIN_DURATION_SEC
+            subs.append(Subtitle(idx, t_st, t_end, _fmtlines(text, target_lang))); idx += 1
+            prev_k = i
+
+    # Garantir l'ordre et l'écart minimal entre sous-titres consécutifs
+    for a, b in zip(subs, subs[1:]):
+        if a.end > b.start - gap:
+            a.end = max(a.start + 0.3, b.start - gap)
+    # Sous-titres trop brefs : étendre dans le silence qui suit, puis « emprunter »
+    # jusqu'à 0,5 s au suivant s'il reste confortable (pratique du relecteur humain)
+    for i, s in enumerate(subs):
+        need = MIN_DURATION_SEC - (s.end - s.start)
+        if need <= 0: continue
+        nxt = subs[i + 1] if i + 1 < len(subs) else None
+        room = (nxt.start - gap - s.end) if nxt else need
+        ext = min(need, max(0.0, room)); s.end += ext; need -= ext
+        if need > 0 and nxt is not None:
+            push = min(need, 0.6, max(0.0, (nxt.end - nxt.start) - 1.5))
+            nxt.start += push; s.end += push
+    print(f"   🧩 {len(groups)} blocs de parole → {len(subs)} sous-titres "
+          f"({n_merged_across} à cheval sur plusieurs segments source)")
+    return subs
+
+
 def resegment(segments: list[Segment], target_lang: str = "fr") -> list[Subtitle]:
     print("\n📐 Re-segmentation...")
 
@@ -2461,45 +2852,16 @@ def resegment(segments: list[Segment], target_lang: str = "fr") -> list[Subtitle
     # (sinon les sous-titres apparaissent en avance pendant les pauses du locuteur)
     segments = _split_on_pauses(segments)
 
-    # ── Phase 1 : fusionner les segments trop courts ──
-    merged = _merge_short(segments, target_lang)
+    # ── Phases 1-3 : regroupement syntaxique optimal ──
+    # Les segments contigus (silence < GROUP_MAX_GAP_SEC) forment un bloc de texte
+    # cible continu ; un optimiseur choisit les coupures qui minimisent un coût
+    # (coupure sur ponctuation forte, pas de fragment, pas d'orphelin, ≤ 2 lignes,
+    # ≤ MAX_DURATION_SEC, débit lisible). On ne découpe plus JAMAIS un segment
+    # pour son seul débit : couper ne réduit pas le CPS, ça crée des fragments
+    # d'une demi-seconde (retour relecteur humain 2026-09-14).
+    subs = _regroup_optimal(segments, target_lang)
 
-    # ── Phase 2 : découpage classique ──
-    subs = []; idx = 1
-    for seg in merged:
-        if not seg.text_tgt or seg.end - seg.start <= 0: continue
-        txt, dur = seg.text_tgt.strip(), seg.end - seg.start
-        cps = len(txt) / dur
-
-        if cps <= MAX_CPS and len(txt) <= MAX_CHARS_PER_LINE * MAX_LINES_PER_SUB:
-            subs.append(Subtitle(idx, seg.start, seg.end, _fmtlines(txt, target_lang)))
-            idx += 1
-        else:
-            parts = _splittext(txt, dur, target_lang)
-            total_chars = sum(len(p) for p in parts)
-            total_gap = (len(parts) - 1) * GAP_BETWEEN_SUBS_MS / 1000
-            usable = max(0, dur - total_gap)
-            t = seg.start
-            for i, p in enumerate(parts):
-                frac = len(p) / total_chars if total_chars > 0 else 1.0 / len(parts)
-                d = max(MIN_DURATION_SEC, usable * frac)
-                te = min(t + d, seg.end)
-                if i == len(parts) - 1:
-                    te = seg.end
-                if t >= seg.end:
-                    # Plus de place : fusionner le texte restant dans le dernier sous-titre
-                    if subs:
-                        remaining = ' '.join(parts[i:])
-                        prev = subs[-1]
-                        merged_txt = prev.text.replace('\n', ' ') + ' ' + remaining
-                        subs[-1] = Subtitle(prev.index, prev.start, seg.end,
-                                            _fmtlines(merged_txt, target_lang))
-                    break
-                subs.append(Subtitle(idx, t, te, _fmtlines(p, target_lang)))
-                idx += 1
-                t = te + GAP_BETWEEN_SUBS_MS / 1000
-
-    # ── Phase 3 : anti-orphelin ──
+    # ── Filet de sécurité anti-orphelin (fusions résiduelles) ──
     subs = _deorphan(subs, target_lang)
 
     subs = _fixtiming(subs)
@@ -2555,7 +2917,7 @@ def _fmtlines(txt: str, target_lang: str = "fr") -> str:
     def _apply_antiorphan(l1: str, l2: str) -> tuple[str, str]:
         """Si l1 finit par un orphelin, déplace-le vers l2 (si ça tient)."""
         w1 = l1.split()
-        if w1 and w1[-1].lower().rstrip("'") in orphans and len(w1) > 1:
+        if w1 and _tok(w1[-1]) in orphans and len(w1) > 1:
             new_l1 = ' '.join(w1[:-1])
             new_l2 = w1[-1] + ' ' + l2
             if len(new_l1) <= MAX_CHARS_PER_LINE and len(new_l2) <= MAX_CHARS_PER_LINE:
@@ -2604,15 +2966,34 @@ def _fmtlines(txt: str, target_lang: str = "fr") -> str:
 
 
 def _findsplit(txt: str, target_lang: str = "fr") -> int:
+    """Meilleure position de retour à la ligne : ponctuation > conjonction >
+    préposition > espace, pondéré par l'équilibre des deux lignes. La coupure se
+    fait APRÈS une ponctuation mais AVANT une conjonction/préposition (qui ouvre
+    la ligne 2, jamais ne ferme la ligne 1)."""
     pats = get_split_patterns(target_lang)
-    tgt = len(txt) // 2; best, bd = -1, len(txt)
-    for pat in pats:
+    class_cost = [0.0, 2.0, 3.0]      # affiné ensuite par _line_break_cost
+    L = len(txt); mid = L / 2
+    orphans = ORPHAN_WORDS.get(target_lang, set())
+    best, bc = -1, float('inf')
+    if L <= MAX_CHARS_PER_LINE: return -1
+
+    def consider(pos: int, base: float):
+        nonlocal best, bc
+        l1, l2 = txt[:pos].strip(), txt[pos:].strip()
+        if not l1 or not l2: return
+        if len(l1) > MAX_CHARS_PER_LINE or len(l2) > MAX_CHARS_PER_LINE: return
+        if l2[0] in _NO_CUT_BEFORE or l1[-1] in _NO_CUT_AFTER: return
+        c = base + abs(pos - mid) / L * 15.0 + _line_break_cost(l1, l2, target_lang)
+        if c < bc: bc, best = c, pos
+
+    for ci, pat in enumerate(pats):
         for m in re.finditer(pat, txt):
-            pos = m.start() + len(m.group()) - 1
-            if len(txt[:pos].strip()) <= MAX_CHARS_PER_LINE and len(txt[pos:].strip()) <= MAX_CHARS_PER_LINE:
-                d = abs(pos - tgt)
-                if d < bd: bd = d; best = pos
-        if best >= 0: break
+            if m.group()[0].isspace():
+                consider(m.start(), class_cost[ci])          # avant le mot-outil
+            else:
+                consider(m.start() + len(m.group()) - 1, class_cost[ci])  # après la ponctuation
+    for m in re.finditer(r' ', txt):
+        consider(m.start(), 3.0)
     return best
 
 
@@ -2681,8 +3062,10 @@ def _deorphan(subs: list[Subtitle], target_lang: str) -> list[Subtitle]:
             raw = sub.text.replace('\n', ' ').strip()
             words = raw.split()
 
-            # Cas 1 : sous-titre trop court (1-2 mots, < MIN_CHARS)
-            is_too_short = len(words) <= 2 and len(raw) < MIN_CHARS_PER_SUB
+            # Cas 1 : sous-titre trop court (1-2 mots, < MIN_CHARS) — sauf phrase complète
+            # autonome (« OK. », « Pourquoi ? ») : c'est l'autre locuteur, on la laisse seule
+            is_too_short = (len(words) <= 2 and len(raw) < MIN_CHARS_PER_SUB
+                            and not (_sentence_end(raw) and raw[0].isupper()))
 
             # Cas 2 : sous-titre finit par un mot orphelin
             last_word = words[-1].lower().rstrip("'«\"(") if words else ""

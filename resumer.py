@@ -19,7 +19,7 @@ Usage :
   python resumer.py video.mp4 -s en --pages 8
   python resumer.py video.mp4 --resume video_segments.json
   python resumer.py video.mp4 --context "Interview avec Dr. X"
-  python resumer.py video.mp4 --claude-model claude-opus-4
+  python resumer.py video.mp4 --claude-model claude-opus-5
 
 Prérequis :
   pip install whisperx anthropic torch torchaudio --break-system-packages
@@ -53,11 +53,12 @@ WHISPER_MODEL = "large-v3"
 WHISPER_BATCH_SIZE = 16
 WHISPER_COMPUTE_TYPE = "float16"
 
-CLAUDE_MODEL = "claude-opus-4-5"  # cf. A/B 2026-05-25 (traduire.py) : sonnet-4-6
+CLAUDE_MODEL = "claude-opus-5"  # cf. A/B 2026-05-25 (traduire.py) : sonnet-4-6
 # produit doublons synonymiques et étoffements malgré prompt explicite.
 CLAUDE_MAX_TOKENS = 16384          # élevé pour la passe synthèse
-CLAUDE_RETRY_MAX = 5
+CLAUDE_RETRY_MAX = 10
 CLAUDE_RETRY_DELAY = 10.0
+CLAUDE_RETRY_DELAY_MAX = 120.0     # plafond du backoff exponentiel
 
 # Ollama (LLM local — alternative gratuite à l'API Claude)
 # Défaut : mistral-small (14 Go) — tient ENTIÈREMENT en VRAM 24 Go (100% GPU,
@@ -215,7 +216,13 @@ def _claude_create(client, **kwargs):
     is_local = isinstance(client, _OllamaClient)
     for attempt in range(1, CLAUDE_RETRY_MAX + 1):
         try:
-            return client.messages.create(**kwargs)
+            resp = client.messages.create(**kwargs)
+            if not is_local:
+                # Opus 5 pense par défaut : les blocs thinking précèdent le texte.
+                # On les retire pour que resp.content[0] reste le texte / tool_use.
+                resp.content = [b for b in resp.content
+                                if b.type not in ("thinking", "redacted_thinking")]
+            return resp
         except Exception as exc:
             retryable = False
             if is_local:
@@ -228,7 +235,7 @@ def _claude_create(client, **kwargs):
                 elif isinstance(exc, anthropic.APIConnectionError):
                     retryable = True
             if retryable and attempt < CLAUDE_RETRY_MAX:
-                delay = CLAUDE_RETRY_DELAY * (2 ** (attempt - 1))
+                delay = min(CLAUDE_RETRY_DELAY * (2 ** (attempt - 1)), CLAUDE_RETRY_DELAY_MAX)
                 label = "Ollama" if is_local else "API Claude"
                 print(f"   ⏳ {label} erreur ({type(exc).__name__}), retry {attempt}/{CLAUDE_RETRY_MAX} dans {delay:.0f}s...")
                 time.sleep(delay)

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Pipeline de doublage IA — XTTS v2 / Qwen3-TTS / ElevenLabs
+Pipeline de doublage IA — Qwen3-TTS / ElevenLabs
 =========================================================================
 Produit une vidéo doublée dans une langue cible avec clonage vocal
 par locuteur, séparation de sources, et mixage professionnel.
-Backends TTS : XTTS v2 (défaut, local, GPU),
-Qwen3-TTS (local, GPU, 10 langues) ou ElevenLabs (API cloud).
+Backends TTS : Qwen3-TTS (défaut, local, GPU, 10 langues)
+ou ElevenLabs (API cloud).
 
 Architecture en 14 passes :
   1. WhisperX          → transcription + timestamps mot par mot
@@ -18,15 +18,14 @@ Architecture en 14 passes :
   4e. Claude            → vérification glossaire (violations → corrections)
   5. Claude             → adaptation isochronique (durée ≈ original)
   5b. Claude            → relecture fluidité post-adaptation (connecteurs, ponctuation)
-  6. XTTS v2 two-pass   → synthèse vocale + ajustement speed natif
+  6. TTS two-pass       → synthèse vocale + ajustement de vitesse
   6c. Boucle qualité    → speed-first, puis réécriture Claude si insuffisant
   6b. Normalisation     → RMS (volume) par défaut ; + F0 WORLD avec --fix-pitch
   7. pydub              → mixage voice-over (voix doublées + originales + fond)
   8. ffmpeg             → assemblage vidéo finale
 
 La passe 6 utilise le two-pass TTS : synthèse à speed=1.0, mesure de la durée,
-re-synthèse avec speed ajusté si nécessaire. Le paramètre speed natif d'XTTS
-modifie le débit au niveau du décodeur, sans artefacts de time-stretching.
+re-synthèse avec speed ajusté si nécessaire.
 Ça élimine la plupart des problèmes de chevauchement/silence dès la synthèse,
 réduisant drastiquement le besoin de réécriture Claude en passe 6c.
 
@@ -38,7 +37,6 @@ avec --no-voiceover pour un doublage pur.
 Usage :
   python doubler.py video.mp4                                      # EN → FR, clonage vocal
   python doubler.py "https://www.youtube.com/watch?v=XXXXX"        # depuis YouTube
-  python doubler.py video.mp4 --xtts-speaker "Craig Gutsy"         # voix preset XTTS
   python doubler.py video.mp4 -s en -t es                          # EN → ES
   python doubler.py video.mp4 --segments segments.json             # reprendre traduction
   python doubler.py video.mp4 --keep-original 0.05                 # garder 5 % voix originale
@@ -47,7 +45,6 @@ Usage :
   python doubler.py video.mp4 --remove-music                        # supprimer musique de fond
   python doubler.py video.mp4 --speakers 2                         # forcer 2 locuteurs
   python doubler.py video.mp4 --ref-voice ref_fr.wav               # voix de référence externe
-  python doubler.py --list-xtts-speakers                           # lister les voix preset
 
 Prérequis :
   pip install whisperx anthropic torch torchaudio demucs pydub soundfile \\
@@ -104,7 +101,7 @@ WHISPER_MODEL = "large-v3"
 WHISPER_BATCH_SIZE = 16
 WHISPER_COMPUTE_TYPE = "float16"
 
-CLAUDE_MODEL = "claude-opus-4-5"  # cf. A/B 2026-05-25 (traduire.py) : sonnet-4-6
+CLAUDE_MODEL = "claude-opus-5"  # cf. A/B 2026-05-25 (traduire.py) : sonnet-4-6
 # produit doublons synonymiques et étoffements malgré prompt explicite.
 CLAUDE_MAX_TOKENS = 8192
 
@@ -112,10 +109,6 @@ CLAUDE_MAX_TOKENS = 8192
 OLLAMA_URL = "http://localhost:11434"
 OLLAMA_MODEL = "gemma4:31b"        # cf. bench 2026-06-22 : meilleur FR oral (traduction)
 OLLAMA_NUM_PREDICT = 16384             # marge large (tokens réflexion Qwen3 inclus)
-
-# TTS
-TTS_BACKEND = "xtts"
-XTTS_MAX_CHARS = 250                # marge de sécurité sous la limite XTTS (273 pour le français)
 
 # Doublage audio
 SAMPLE_RATE = 44100
@@ -131,15 +124,35 @@ TTS_ANTI_CLICK_MS = 15               # micro-fondu anti-clic sur chaque clip TTS
 AUDIO_ONLY_PAUSE_MS = 600            # pause entre segments d'un même locuteur
 AUDIO_ONLY_SPEAKER_PAUSE_MS = 900    # pause lors d'un changement de locuteur
 
-# Two-pass TTS : ajustement de vitesse natif XTTS (speed parameter)
+# Two-pass TTS : ajustement de vitesse du moteur TTS
 # Élimine la plupart des chevauchements sans réécriture Claude ni time-stretching
-XTTS_SPEED_MIN = 0.82               # en dessous, la qualité XTTS se dégrade
-XTTS_SPEED_MAX = 1.30               # au-dessus, la qualité XTTS se dégrade
-XTTS_SPEED_TOLERANCE = 0.10         # ±10% → pas de re-synthèse (assez proche)
-XTTS_SPEED_RESCUE_MAX = 1.40        # vitesse max en "sauvetage" (passe 6c)
+TTS_SPEED_TOLERANCE = 0.10         # ±10% → pas de re-synthèse (assez proche)
+TTS_SPEED_RESCUE_MAX = 1.40        # vitesse max en "sauvetage" (passe 6c)
 SPEED_COMFORT_MAX = 1.20             # au-delà, accélération perceptible → préférer réécriture
+def _emprunt_sec(seg):
+    """Silence amont (en secondes) que ce segment est autorisé à s'approprier.
 
-# ElevenLabs (API cloud — alternative à XTTS)
+    Doit être pris en compte PARTOUT où l'on calcule la fenêtre disponible ou
+    la fin d'un clip : sinon le détecteur de chevauchements voit déborder un
+    clip qui, en réalité, démarre plus tôt — et déclenche une re-synthèse
+    comprimée qui annule le bénéfice.
+    """
+    return getattr(seg, "_borrow_ms", 0) / 1000
+
+
+TTS_BEST_OF_N = 3                    # tirages pour un segment qui déborderait. Qwen3-TTS
+                                     # échantillonne (do_sample=True) : la même phrase varie
+                                     # de ~30 % d'un tirage à l'autre (mesuré sur Fico :
+                                     # 2,24 / 2,80 / 2,96 s). Autant choisir au lieu de subir.
+MAX_BORROW_BEFORE_MS = 300           # silence AMONT qu'un clip peut s'approprier quand il
+                                     # déborde, plutôt que de subir l'accélération. Volontairement
+                                     # court (~une syllabe) : au-delà, le doublage décolle
+                                     # visiblement de la bouche du locuteur. Mesuré sur le
+                                     # discours de Fico : 300 ms suffisent à ramener
+                                     # « Mesdames et Messieurs, je n'exagère pas » de 1.30
+                                     # (clampé à 1.20) à 1.11, sans décalage perceptible.
+
+# ElevenLabs (API cloud)
 ELEVENLABS_MAX_CHARS = 5000
 ELEVENLABS_MODEL_DEFAULT = "eleven_multilingual_v2"
 ELEVENLABS_OUTPUT_FORMAT = "mp3_44100_128"
@@ -152,8 +165,9 @@ ELEVENLABS_RETRY_MAX = 3
 ELEVENLABS_RETRY_DELAY = 2.0
 
 # Retry API Claude (erreurs transitoires : 529 Overloaded, 429 Rate Limit, 500+)
-CLAUDE_RETRY_MAX = 5
+CLAUDE_RETRY_MAX = 10
 CLAUDE_RETRY_DELAY = 10.0              # délai initial en secondes (backoff exponentiel)
+CLAUDE_RETRY_DELAY_MAX = 120.0         # plafond du backoff (un épisode 529 Overloaded peut durer plusieurs minutes)
 
 # Mode voice-over (style Arte / documentaire / reportage)
 # Réf : EBU R 128, pratiques Arte/France 2/BBC pour interviews traduits
@@ -262,7 +276,13 @@ def _claude_create(client, **kwargs):
     is_local = isinstance(client, _OllamaClient)
     for attempt in range(1, CLAUDE_RETRY_MAX + 1):
         try:
-            return client.messages.create(**kwargs)
+            resp = client.messages.create(**kwargs)
+            if not is_local:
+                # Opus 5 pense par défaut : les blocs thinking précèdent le texte.
+                # On les retire pour que resp.content[0] reste le texte / tool_use.
+                resp.content = [b for b in resp.content
+                                if b.type not in ("thinking", "redacted_thinking")]
+            return resp
         except Exception as exc:
             retryable = False
             if is_local:
@@ -275,7 +295,7 @@ def _claude_create(client, **kwargs):
                 elif isinstance(exc, anthropic.APIConnectionError):
                     retryable = True
             if retryable and attempt < CLAUDE_RETRY_MAX:
-                delay = CLAUDE_RETRY_DELAY * (2 ** (attempt - 1))
+                delay = min(CLAUDE_RETRY_DELAY * (2 ** (attempt - 1)), CLAUDE_RETRY_DELAY_MAX)
                 label = "Ollama" if is_local else "API Claude"
                 print(f"   ⏳ {label} erreur ({type(exc).__name__}), retry {attempt}/{CLAUDE_RETRY_MAX} dans {delay:.0f}s...")
                 time.sleep(delay)
@@ -503,7 +523,7 @@ QWEN3TTS_MAX_CHARS = 300
 QWEN3TTS_SPEED_MIN = 0.70
 QWEN3TTS_SPEED_MAX = 1.50
 QWEN3TTS_SPEED_TOLERANCE = 0.10
-QWEN3TTS_SPEED_RESCUE_MAX = 1.40    # vitesse max en "sauvetage" (passe 6c) — alignée sur XTTS
+QWEN3TTS_SPEED_RESCUE_MAX = 1.40    # vitesse max en "sauvetage" (passe 6c)
 QWEN3TTS_LANG_MAP = {
     "zh": "Chinese", "en": "English", "ja": "Japanese", "ko": "Korean",
     "de": "German", "fr": "French", "ru": "Russian", "pt": "Portuguese",
@@ -550,11 +570,6 @@ def check_dependencies(tts_backend: str):
             print("   elevenlabs  : ❌  → pip install elevenlabs --break-system-packages"); ok = False
         if not os.environ.get("ELEVENLABS_API_KEY"):
             print("   ⚠️  ELEVENLABS_API_KEY non définie"); ok = False
-    else:
-        try:
-            __import__("TTS"); print("   xtts-v2     : ✅")
-        except ImportError:
-            print("   xtts-v2     : ❌  → pip install TTS --break-system-packages"); ok = False
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("   ⚠️  ANTHROPIC_API_KEY non définie"); ok = False
@@ -1474,6 +1489,15 @@ RÈGLES SPÉCIFIQUES AU DOUBLAGE :
 10. Garde le REGISTRE de chaque locuteur (formel, familier, technique...)
 11. Préfère les mots courts mais ne sacrifie JAMAIS un détail informatif
     (chiffre, exemple, qualificatif) pour gagner des caractères.
+12. DATES : années en entier — une année abrégée à l'oral (« März 20 »,
+    « in '19 ») devient « mars 2020 », « en 2019 » d'après le contexte.
+13. RÉPÉTITIONS : une désignation longue (titre + nom, nom complet d'une
+    organisation) s'écrit en entier à sa première occurrence, puis sous
+    forme courte (nom seul, « cette initiative », pronom) — sans jamais
+    descendre sous le minimum de longueur du segment. Varie les
+    énumérateurs (« tout d'abord… ensuite… enfin »).
+14. Une expression consacrée vaut mieux qu'une paraphrase (« prendre pour
+    argent comptant » plutôt que « accepter d'abord comme un fait »).
 
 CHANTS, PRIÈRES ET PASSAGES RITUELS :
 Si un segment est un chant, une prière, un mantra, une récitation ou un texte
@@ -2258,7 +2282,7 @@ Le champ text contient uniquement la phrase corrigée — pas de commentaire.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PASSE 6 : SYNTHÈSE VOCALE (XTTS v2)
+# PASSE 6 : SYNTHÈSE VOCALE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TTSBackend:
@@ -2311,446 +2335,6 @@ class TTSBackend:
     def cleanup(self):
         pass
 
-
-
-# ── Voix preset XTTS v2 ──────────────────────────────────────────────────────
-# Stockées dans speakers_xtts.pth du modèle. Accès via tts.speakers ou --list_speaker_idxs.
-# Classées par genre, priorité broadcast (voix posées en premier).
-XTTS_VOICES_FEMALE = [
-    "Ana Florence", "Brenda Stern", "Claribel Dervla", "Gracie Wise",
-    "Henriette Usha", "Sofia Hellen", "Tanja Adelina", "Alma María",
-    "Daisy Studious", "Gitta Nikolina", "Tamaru Naoko", "Lidiya Szekeres",
-]
-XTTS_VOICES_MALE = [
-    "Craig Gutsy", "Damien Black", "Viktor Menelaos", "Baldur Sanjin",
-    "Dionisio Schuyler", "Royston Min", "Abrahan Mack", "Gilberto Mathias",
-    "Kazuhiko Atallah", "Torcull Diarmuid", "Zacharie Aimilios", "Viktor Eka",
-]
-XTTS_DEFAULT_VOICES = [
-    "Craig Gutsy", "Ana Florence", "Damien Black", "Brenda Stern",
-    "Viktor Menelaos", "Claribel Dervla", "Baldur Sanjin", "Gracie Wise",
-]
-
-
-class XTTSBackend(TTSBackend):
-    """Backend XTTS v2 (Coqui TTS — local, GPU, multilingue, zero-shot cloning)."""
-
-    # Mapping des codes langue doubler.py → codes XTTS v2
-    XTTS_LANG_MAP = {
-        "fr": "fr", "en": "en", "es": "es", "de": "de", "it": "it",
-        "pt": "pt", "pl": "pl", "tr": "tr", "ru": "ru", "nl": "nl",
-        "cs": "cs", "ar": "ar", "zh": "zh", "ja": "ja", "ko": "ko",
-        "hu": "hu", "hi": "hi",
-    }
-
-    def __init__(self, target_lang: str = "fr", ref_voice: Optional[str] = None,
-                 xtts_speaker: Optional[str] = None):
-        from TTS.api import TTS as CoquiTTS
-        print("   🔊 Chargement du modèle XTTS v2...")
-        self.model = CoquiTTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
-        self.target_lang = self.XTTS_LANG_MAP.get(target_lang, target_lang)
-        self.profiles: dict[str, SpeakerProfile] = {}
-        self.ref_voice = ref_voice  # override optionnel
-        self.xtts_speaker = xtts_speaker  # voix preset (ex: "Craig Gutsy")
-        self.voice_map: dict[str, str] = {}  # speaker_id → preset voice name
-        # Warm-up : le premier appel XTTS produit souvent un audio dégradé
-        # (décodeur autorégressif pas encore stabilisé). On force un appel
-        # silencieux avec un preset pour "chauffer" le modèle.
-        try:
-            import tempfile
-            warmup_path = os.path.join(tempfile.gettempdir(), "_xtts_warmup.wav")
-            self.model.tts_to_file(
-                text="Bonjour, bienvenue.",
-                speaker="Craig Gutsy",
-                language=self.target_lang,
-                file_path=warmup_path,
-            )
-            if os.path.exists(warmup_path):
-                os.remove(warmup_path)
-        except Exception:
-            pass  # ne pas bloquer si le warm-up échoue
-        print(f"   ✅ XTTS v2 prêt (langue cible: {self.target_lang})")
-
-    def setup_voices(self, profiles: dict[str, SpeakerProfile]):
-        self.profiles = profiles
-        speakers = sorted(profiles.keys())
-
-        if self.ref_voice:
-            print(f"      🎯 Voix de référence externe : {self.ref_voice}")
-
-        # Assigner des voix preset pour les locuteurs sans ref_clips
-        if self.xtts_speaker:
-            # Override unique
-            for spk in speakers:
-                self.voice_map[spk] = self.xtts_speaker
-            print(f"      🎯 Voix preset '{self.xtts_speaker}' pour {len(speakers)} locuteur(s)")
-        else:
-            female_idx = male_idx = unknown_idx = 0
-            for spk in speakers:
-                p = profiles[spk]
-                has_ref = bool(p.ref_clips) or (p.sample_path and os.path.exists(p.sample_path))
-
-                if has_ref and not self.xtts_speaker:
-                    # On utilisera le clonage vocal → pas de preset
-                    icon = "🎙️"
-                    ref_count = len(p.ref_clips) if p.ref_clips else 1
-                    print(f"      {icon} {spk} : clonage vocal ({ref_count} refs, "
-                          f"{p.total_duration:.0f}s)")
-                else:
-                    # Assigner une voix preset par genre
-                    gender = p.gender
-                    if gender == "female":
-                        voice = XTTS_VOICES_FEMALE[female_idx % len(XTTS_VOICES_FEMALE)]
-                        female_idx += 1
-                    elif gender == "male":
-                        voice = XTTS_VOICES_MALE[male_idx % len(XTTS_VOICES_MALE)]
-                        male_idx += 1
-                    else:
-                        voice = XTTS_DEFAULT_VOICES[unknown_idx % len(XTTS_DEFAULT_VOICES)]
-                        unknown_idx += 1
-                    self.voice_map[spk] = voice
-                    gender_icon = "♀️" if gender == "female" else "♂️" if gender == "male" else "❓"
-                    print(f"      🎤 {spk} {gender_icon} → preset \"{voice}\"")
-
-        # Voix appariées manuellement (--map-voices) : on force le clonage depuis
-        # le fichier choisi. Chez XTTS, un voice_map non vide = preset ; on le
-        # vide donc pour que _synthesize retombe sur _get_best_ref (→ fichier).
-        if getattr(self, "_voice_overrides", None):
-            if not hasattr(self, "_speaker_ref_voice"):
-                self._speaker_ref_voice = {}
-            for spk, path in self._voice_overrides.items():
-                if not path:
-                    continue
-                self._speaker_ref_voice[spk] = path
-                self.voice_map.pop(spk, None)
-                print(f"      🎯 {spk} → voix appariée : {os.path.basename(path)}")
-
-    def _get_best_ref(self, speaker_id: str) -> str:
-        """Retourne le chemin du meilleur audio de référence pour le cloning."""
-        if self.ref_voice:
-            return self.ref_voice
-
-        # Voix appariée manuellement (--map-voices) : priorité absolue
-        if speaker_id in getattr(self, "_speaker_ref_voice", {}):
-            return self._speaker_ref_voice[speaker_id]
-
-        profile = self.profiles.get(speaker_id)
-        if not profile:
-            profile = next((p for p in self.profiles.values()
-                            if p.ref_clips or p.sample_path), None)
-        if not profile:
-            return ""
-
-        # Préférer le clip le plus long (premier de ref_clips, trié par durée)
-        if profile.ref_clips:
-            return profile.ref_clips[0][0]  # (path, text) → path
-
-        if profile.sample_path and os.path.exists(profile.sample_path):
-            return profile.sample_path
-
-        return ""
-
-    @staticmethod
-    def _split_text_for_tts(text: str, max_chars: int = XTTS_MAX_CHARS) -> list[str]:
-        """
-        Découpe un texte en morceaux de max_chars aux frontières naturelles.
-        Priorité : phrase (. ! ?) > clause (, ; :) > espace.
-        """
-        if len(text) <= max_chars:
-            return [text]
-
-        chunks = []
-        remaining = text.strip()
-
-        while len(remaining) > max_chars:
-            # Chercher le meilleur point de coupure dans la fenêtre [0, max_chars]
-            window = remaining[:max_chars]
-            cut = -1
-
-            # Priorité 1 : fin de phrase
-            for sep in [". ", "! ", "? ", ".\n", "!\n", "?\n"]:
-                idx = window.rfind(sep)
-                if idx > max_chars // 3:  # pas trop tôt dans le texte
-                    cut = idx + 1  # inclure le séparateur
-                    break
-
-            # Priorité 2 : clause (virgule, point-virgule, deux-points)
-            if cut < 0:
-                for sep in [", ", "; ", ": ", " – ", " — "]:
-                    idx = window.rfind(sep)
-                    if idx > max_chars // 3:
-                        cut = idx + len(sep)
-                        break
-
-            # Priorité 3 : n'importe quel espace
-            if cut < 0:
-                idx = window.rfind(" ")
-                if idx > max_chars // 4:
-                    cut = idx + 1
-
-            # Fallback : couper brutalement
-            if cut < 0:
-                cut = max_chars
-
-            chunks.append(remaining[:cut].strip())
-            remaining = remaining[cut:].strip()
-
-        if remaining:
-            chunks.append(remaining)
-
-        return chunks
-
-    def synthesize(self, text: str, speaker_id: str, output_path: str,
-                   target_duration: float = 0.0) -> str:
-        """
-        Synthèse vocale avec ajustement de vitesse two-pass.
-        
-        Si target_duration > 0 :
-          Passe 1 → synthèse à speed=1.0, trim silence, mesure de la durée réelle
-          Calcul du ratio needed_speed = durée_trimmée / target_duration
-          Passe 2 → re-synthèse avec speed ajusté, trim, vérification
-          Si encore trop long → passe 2b avec speed corrigé (max 1 retry)
-        
-        Le paramètre speed natif d'XTTS modifie le débit au niveau du décodeur,
-        sans artefacts de time-stretching.
-        """
-        chunks = self._split_text_for_tts(text) if len(text) > XTTS_MAX_CHARS else [text]
-
-        # ── Passe 1 : synthèse à speed=1.0 ──────────────────────────────────
-        result = self._synthesize_chunks(chunks, speaker_id, output_path, speed=1.0)
-        if not result:
-            return ""
-
-        # ── Sans cible temporelle → on garde la passe 1 ─────────────────────
-        if target_duration <= 0:
-            return result
-
-        # ── Trimmer AVANT de mesurer (supprime le silence parasite XTTS) ─────
-        trimmed_dur = _trim_tts_silence(result)
-        if trimmed_dur < 0.1:
-            return result
-
-        needed_speed = trimmed_dur / target_duration
-
-        # ── Dans la tolérance ? → garder tel quel ───────────────────────────
-        if abs(needed_speed - 1.0) <= XTTS_SPEED_TOLERANCE:
-            return result
-
-        # ── Clamper à la plage de qualité XTTS ──────────────────────────────
-        clamped_speed = max(XTTS_SPEED_MIN, min(XTTS_SPEED_MAX, needed_speed))
-
-        # ── Passe 2 : re-synthèse avec vitesse ajustée ─────────────────────
-        result2 = self._synthesize_chunks(chunks, speaker_id, output_path,
-                                          speed=clamped_speed)
-        if not result2:
-            return result  # fallback sur passe 1
-
-        # Trim + mesure post-passe-2
-        pass2_dur = _trim_tts_silence(result2)
-
-        # ── Vérification : si encore trop long, retry avec speed corrigé ────
-        # Le speed XTTS n'est pas linéaire, donc on corrige empiriquement.
-        if pass2_dur > target_duration * 1.08 and clamped_speed < XTTS_SPEED_MAX:
-            # Correction : ratio réel observé entre passe 1 et passe 2
-            # speed_effective = trimmed_dur / pass2_dur (combien le speed a réellement accéléré)
-            # On ajuste pour atteindre la cible
-            correction_speed = clamped_speed * (pass2_dur / target_duration)
-            correction_speed = max(XTTS_SPEED_MIN, min(XTTS_SPEED_MAX, correction_speed))
-
-            if abs(correction_speed - clamped_speed) > 0.03:  # correction significative
-                result3 = self._synthesize_chunks(chunks, speaker_id, output_path,
-                                                  speed=correction_speed)
-                if result3:
-                    pass3_dur = _trim_tts_silence(result3)
-                    # Garder le meilleur (le plus proche de la cible sans la dépasser)
-                    if pass3_dur <= target_duration * 1.08 or pass3_dur < pass2_dur:
-                        pass2_dur = pass3_dur
-                        clamped_speed = correction_speed
-
-        icon = "🏃" if clamped_speed > 1.0 else "🐢"
-        clamp_note = ""
-        if abs(clamped_speed - needed_speed) > 0.01:
-            clamp_note = f" [clampé, idéal={needed_speed:.2f}]"
-        overshoot = ""
-        if pass2_dur > target_duration * 1.05:
-            overshoot = f" ⚠️+{(pass2_dur - target_duration)*1000:.0f}ms"
-        print(f"      {icon} Two-pass: {trimmed_dur:.2f}s→{pass2_dur:.2f}s "
-              f"(cible {target_duration:.2f}s, speed={clamped_speed:.2f}{clamp_note}{overshoot})")
-
-        return output_path
-
-    def _synthesize_chunks(self, chunks: list[str], speaker_id: str,
-                           output_path: str, speed: float = 1.0) -> str:
-        """
-        Synthétise une liste de chunks de texte et les concatène.
-        Factorise la logique mono-chunk et multi-chunk.
-        """
-        if len(chunks) == 1:
-            return self._synthesize_single(chunks[0], speaker_id, output_path,
-                                           speed=speed)
-
-        import soundfile as sf
-        import numpy as np
-
-        chunk_paths = []
-        out_dir = os.path.dirname(output_path)
-        base = os.path.splitext(os.path.basename(output_path))[0]
-
-        for ci, chunk_text in enumerate(chunks):
-            chunk_path = os.path.join(out_dir, f"{base}_part{ci:02d}.wav")
-            result = self._synthesize_single(chunk_text, speaker_id, chunk_path,
-                                             speed=speed)
-            if result:
-                chunk_paths.append(result)
-            else:
-                print(f"      ⚠️  Chunk {ci+1}/{len(chunks)} échoué ({len(chunk_text)} chars)")
-
-        if not chunk_paths:
-            return ""
-
-        if len(chunk_paths) == 1:
-            shutil.move(chunk_paths[0], output_path)
-            return output_path
-
-        # Concaténer avec micro-crossfade de 128 samples aux jonctions
-        arrays = []
-        sr = None
-        for cp in chunk_paths:
-            data, file_sr = sf.read(cp, dtype="float32")
-            if sr is None:
-                sr = file_sr
-            arrays.append(data)
-
-        crossfade_samples = min(128, min(len(a) for a in arrays) // 2) if arrays else 0
-        gap_samples = int(sr * 0.08)
-        combined = []
-        for i, arr in enumerate(arrays):
-            if i > 0:
-                if crossfade_samples > 0 and len(combined) > 0:
-                    prev = combined[-1]
-                    fade_out = np.linspace(1.0, 0.0, crossfade_samples, dtype=np.float32)
-                    prev[-crossfade_samples:] *= fade_out
-                    combined[-1] = prev
-                    combined.append(np.zeros(gap_samples, dtype=np.float32))
-                    fade_in = np.linspace(0.0, 1.0, crossfade_samples, dtype=np.float32)
-                    arr = arr.copy()
-                    arr[:crossfade_samples] *= fade_in
-                else:
-                    combined.append(np.zeros(gap_samples, dtype=np.float32))
-            combined.append(arr)
-
-        result = np.concatenate(combined, axis=0)
-        sf.write(output_path, result, sr, subtype="PCM_16")
-
-        # Nettoyage des fichiers temporaires
-        for cp in chunk_paths:
-            if os.path.exists(cp):
-                os.remove(cp)
-
-        return output_path
-
-    def synthesize_with_speed(self, text: str, speaker_id: str,
-                              output_path: str, speed: float = 1.0) -> str:
-        """
-        Synthèse directe à une vitesse donnée (sans logique two-pass).
-        Utilisé par verify_and_fix_timing pour le sauvetage par speed.
-        Trimme automatiquement le silence XTTS.
-        """
-        chunks = self._split_text_for_tts(text) if len(text) > XTTS_MAX_CHARS else [text]
-        result = self._synthesize_chunks(chunks, speaker_id, output_path, speed=speed)
-        if result:
-            _trim_tts_silence(result)
-        return result
-
-    def _synthesize_single(self, text: str, speaker_id: str, output_path: str,
-                           speed: float = 1.0) -> str:
-        """
-        Synthèse d'un seul morceau de texte (doit être ≤ XTTS_MAX_CHARS).
-        Utilise model.tts() (pas tts_to_file) pour exposer le paramètre speed natif XTTS.
-        speed=1.0 → débit normal ; speed=1.2 → 20% plus rapide au niveau du modèle.
-
-        Paramètres anti-bégaiement à 3 paliers selon la longueur du texte :
-        - < 20 chars : très agressif (le décodeur boucle facilement sur les textes très courts)
-        - 20–50 chars : intermédiaire
-        - > 50 chars : relâché (le contexte suffit à stabiliser le décodeur)
-        """
-        import soundfile as sf
-        import numpy as np
-
-        # Nettoyage phonétique — garantit que XTTS ne prononce pas la ponctuation
-        text = _clean_for_tts(text, lang=self.target_lang)
-        if not text:
-            return ""
-
-        n_chars = len(text)
-        if n_chars < 20:
-            # Très court : paramètres fermes mais pas extrêmes
-            # (12.0/0.30 causait des arrêts prématurés sur mots étrangers)
-            xtts_kwargs = dict(
-                repetition_penalty=7.0,
-                temperature=0.45,
-                top_k=30,
-                top_p=0.70,
-                enable_text_splitting=False,
-            )
-        elif n_chars <= 50:
-            # Intermédiaire
-            xtts_kwargs = dict(
-                repetition_penalty=5.5,
-                temperature=0.55,
-                top_k=40,
-                top_p=0.80,
-                enable_text_splitting=False,
-            )
-        else:
-            # Normal : relâché
-            xtts_kwargs = dict(
-                repetition_penalty=5.0,
-                temperature=0.65,
-                top_k=50,
-                top_p=0.85,
-                enable_text_splitting=False,
-            )
-
-        preset_voice = self.voice_map.get(speaker_id)
-
-        try:
-            if preset_voice:
-                wav = self.model.tts(
-                    text=text,
-                    speaker=preset_voice,
-                    language=self.target_lang,
-                    speed=speed,
-                    **xtts_kwargs,
-                )
-            else:
-                ref_path = self._get_best_ref(speaker_id)
-                if not ref_path:
-                    print(f"      ❌ Aucun échantillon disponible pour {speaker_id}")
-                    return ""
-                wav = self.model.tts(
-                    text=text,
-                    speaker_wav=ref_path,
-                    language=self.target_lang,
-                    speed=speed,
-                    **xtts_kwargs,
-                )
-
-            # model.tts() retourne une liste de floats — sauvegarder manuellement
-            wav_np = np.array(wav, dtype=np.float32)
-            # Sample rate XTTS v2 = 24000 Hz (via model.synthesizer.output_sample_rate)
-            out_sr = getattr(self.model.synthesizer, 'output_sample_rate', 24000)
-            sf.write(output_path, wav_np, out_sr, subtype="PCM_16")
-            return output_path
-        except Exception as e:
-            print(f"      ❌ XTTS échoué [{speaker_id}] speed={speed:.2f} : {e}")
-            return ""
-
-    def cleanup(self):
-        del self.model; gc.collect()
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
 
 class ElevenLabsBackend(TTSBackend):
@@ -2847,7 +2431,7 @@ class ElevenLabsBackend(TTSBackend):
           Synthèse à vitesse normale → mesure durée → atempo pour ajuster.
           Plage : 0.70–1.50 (traitement signal pur, pas de dégradation modèle).
         """
-        text = _clean_for_tts(text, lang=self.target_lang)
+        text = _clean_for_tts(text, lang=self.target_lang, backend="elevenlabs")
         if not text:
             return ""
 
@@ -2872,7 +2456,7 @@ class ElevenLabsBackend(TTSBackend):
         needed_speed = real_dur / target_duration
 
         # Dans la tolérance ? → garder tel quel
-        if abs(needed_speed - 1.0) <= XTTS_SPEED_TOLERANCE:
+        if abs(needed_speed - 1.0) <= TTS_SPEED_TOLERANCE:
             return result
 
         if needed_speed < 1.0:
@@ -2904,7 +2488,7 @@ class ElevenLabsBackend(TTSBackend):
     def synthesize_with_speed(self, text: str, speaker_id: str,
                               output_path: str, speed: float = 1.0) -> str:
         """Synthèse directe puis atempo (accélération uniquement) ou silence padding."""
-        text = _clean_for_tts(text, lang=self.target_lang)
+        text = _clean_for_tts(text, lang=self.target_lang, backend="elevenlabs")
         if not text:
             return ""
 
@@ -3053,7 +2637,7 @@ class ElevenLabsBackend(TTSBackend):
     def _split_text_for_tts(text: str, max_chars: int = ELEVENLABS_MAX_CHARS) -> list[str]:
         """
         Découpe un texte en morceaux de max_chars aux frontières naturelles.
-        Même logique que XTTSBackend (sentence > clause > space > hard).
+        Frontières par ordre de préférence : sentence > clause > space > hard.
         """
         if len(text) <= max_chars:
             return [text]
@@ -3476,6 +3060,14 @@ class Qwen3TTSBackend(TTSBackend):
         Sans ref_text, le bridge bascule en x_vector_only (timbre seul,
         similarité ~0.75 vs ~0.89 avec ICL). On fait donc l'effort de
         toujours fournir le transcript quand il est disponible.
+
+        ATTENTION — les voix de la banque (--ref-voice / --ref-voices)
+        renvoient volontairement un transcript vide. Ce n'est PAS un oubli :
+        test à l'écoute du 19/09/2026 (discours de Fico, voix homme1), l'ICL
+        raccourcit les pauses entre les phrases et perd en naturel. Le chiffre
+        0.89 vs 0.75 vient des benchmarks Qwen et mesure la ressemblance du
+        TIMBRE, pas le naturel de la prosodie en français long. Ne pas
+        "corriger" en transcrivant voix/*.wav : ce serait une régression.
         """
         if self.ref_voice:
             return (self.ref_voice, "")
@@ -3646,6 +3238,54 @@ class Qwen3TTSBackend(TTSBackend):
 
         return output_path
 
+    def _meilleur_tirage(self, chunks, speaker_id, output_path,
+                         target_duration, dur_initial):
+        """Produit plusieurs versions du même texte et garde la mieux calibrée.
+
+        Critère : parmi les tirages qui ENTRENT dans la fenêtre, le plus long
+        — aucune accélération, et le minimum de silence de remplissage. Si
+        aucun n'entre, le plus court, qui demandera la plus faible
+        accélération. Les deux extrêmes sont ce qu'on cherche à éviter : une
+        phrase bousculée, ou un trou juste après.
+
+        Retourne (durée_retenue, vitesse_nécessaire).
+        """
+        import shutil as _shutil
+        import soundfile as sf
+
+        base = os.path.splitext(output_path)[0]
+        candidats = [(dur_initial, output_path)]
+        for essai in range(1, TTS_BEST_OF_N):
+            cand = f"{base}.tirage{essai}.wav"
+            try:
+                if not self._synthesize_chunks(chunks, speaker_id, cand):
+                    continue
+                d = sf.info(cand).duration
+            except Exception:
+                continue
+            if d >= 0.1:
+                candidats.append((d, cand))
+
+        if len(candidats) == 1:
+            return dur_initial, dur_initial / target_duration
+
+        entrants = [c for c in candidats if c[0] <= target_duration]
+        meilleur = (max(entrants, key=lambda c: c[0]) if entrants
+                    else min(candidats, key=lambda c: c[0]))
+
+        durees = ", ".join(f"{d:.2f}" for d, _ in candidats)
+        retenu = "entre dans la fenêtre" if entrants else "le plus court"
+        print(f"      🎲 {len(candidats)} tirages ({durees}s) → {meilleur[0]:.2f}s "
+              f"({retenu}, cible {target_duration:.2f}s)")
+
+        if meilleur[1] != output_path:
+            _shutil.move(meilleur[1], output_path)
+        for _, chemin in candidats:
+            if chemin != output_path and os.path.exists(chemin):
+                os.remove(chemin)
+
+        return meilleur[0], meilleur[0] / target_duration
+
     def synthesize(self, text: str, speaker_id: str, output_path: str,
                    target_duration: float = 0.0) -> str:
         """
@@ -3653,6 +3293,8 @@ class Qwen3TTSBackend(TTSBackend):
 
         Qwen3-TTS n'expose pas de speed natif via l'API Python.
         Si target_duration > 0 : synthèse normale → mesure → atempo pour ajuster.
+        Si le premier tirage imposerait une accélération au-delà du confort,
+        on en tire d'autres et on garde le mieux calibré (voir _meilleur_tirage).
         """
         text = _clean_for_tts(text, lang=self.target_lang, backend="qwen3tts")
         if not text:
@@ -3674,6 +3316,12 @@ class Qwen3TTSBackend(TTSBackend):
             return result
 
         needed_speed = real_dur / target_duration
+
+        # Le premier tirage imposerait une accélération audible : on en tente
+        # d'autres plutôt que de comprimer celui-ci.
+        if needed_speed > SPEED_COMFORT_MAX and TTS_BEST_OF_N > 1:
+            real_dur, needed_speed = self._meilleur_tirage(
+                chunks, speaker_id, result, target_duration, real_dur)
 
         if abs(needed_speed - 1.0) <= QWEN3TTS_SPEED_TOLERANCE:
             return result
@@ -3753,8 +3401,7 @@ class Qwen3TTSBackend(TTSBackend):
 def create_tts_backend(ref_voice: Optional[str] = None,
                        target_lang: str = "fr",
                        source_lang: str = "en",
-                       xtts_speaker: Optional[str] = None,
-                       backend: str = "xtts",
+                       backend: str = "qwen3tts",
                        elevenlabs_voice: Optional[str] = None,
                        elevenlabs_model: Optional[str] = None,
                        ref_voices_dir: Optional[str] = None) -> TTSBackend:
@@ -3766,22 +3413,21 @@ def create_tts_backend(ref_voice: Optional[str] = None,
             source_lang=source_lang,
             ref_voices_dir=ref_voices_dir,
         )
-    elif backend == "elevenlabs":
+    if backend == "elevenlabs":
         return ElevenLabsBackend(
             target_lang=target_lang,
             ref_voice=ref_voice,
             elevenlabs_voice=elevenlabs_voice,
             elevenlabs_model=elevenlabs_model,
         )
-    return XTTSBackend(target_lang=target_lang, ref_voice=ref_voice,
-                       xtts_speaker=xtts_speaker)
+    raise ValueError(f"Backend TTS inconnu : {backend}")
 
 
 def _trim_tts_silence(audio_path: str, threshold_db: float = -40.0,
                       min_silence_ms: int = 100, keep_ms: int = 50) -> float:
     """
     Supprime le silence en début et fin d'un clip TTS (in-place).
-    XTTS ajoute souvent 200-500ms de silence parasite.
+    Les moteurs TTS ajoutent souvent 200-500ms de silence parasite.
 
     - threshold_db : seuil en dB sous lequel on considère comme silence
     - min_silence_ms : durée min de silence pour être considéré comme "trimmable"
@@ -3853,14 +3499,14 @@ def _trim_tts_silence(audio_path: str, threshold_db: float = -40.0,
     return len(data) / sr
 
 
-def _clean_for_tts(text, lang="fr", backend="xtts"):
+def _clean_for_tts(text, lang="fr", backend="qwen3tts"):
     """
     Nettoyage phonétique pré-TTS : supprime les caractères que les moteurs TTS
     prononcent littéralement ("point", "guillemet", etc.).
     Principe : le texte doit contenir UNIQUEMENT ce qu'on veut entendre.
 
-    Tous les backends : les points "." sont remplacés par ";" (pause naturelle
-    sans vocalisation). Aucun moteur TTS ne prononce le point-virgule.
+    Les points de fin de phrase sont conservés (intonation descendante,
+    cf. étape 9).
     """
     if not text:
         return text
@@ -3909,7 +3555,7 @@ def _clean_for_tts(text, lang="fr", backend="xtts"):
     if lang == "fr":
         text = re.sub(r'(\d)\.(\d)', r'\1 virgule \2', text)
 
-    # 5. Guillemets (XTTS les lit parfois comme "guillemet")
+    # 5. Guillemets (parfois lus comme "guillemet")
     text = re.sub(r'[«»""„]', '', text)
     text = text.replace('"', '')
 
@@ -3918,7 +3564,7 @@ def _clean_for_tts(text, lang="fr", backend="xtts"):
     # Tirets entourés d'espaces → espace simple
     text = re.sub(r'\s+-\s+', ' ', text)
 
-    # 7. Caractères spéciaux que XTTS pourrait vocaliser
+    # 7. Caractères spéciaux que le moteur pourrait vocaliser
     text = re.sub(r'[#*_~`|\\]', '', text)
     # Contenu entre parenthèses/crochets → supprimé (souvent des didascalies)
     text = re.sub(r'\([^)]*\)', '', text)
@@ -3930,23 +3576,23 @@ def _clean_for_tts(text, lang="fr", backend="xtts"):
                      "ja": "と", "zh": "和", "ko": "와"}
     text = text.replace("&", f" {ampersand_map.get(lang, 'et')} ")
 
-    # 9. NUCLEAR FIX : remplacer TOUS les points restants par des points-virgules.
-    # Tous les backends TTS (XTTS, Qwen3-TTS, ElevenLabs) vocalisent "."
-    # comme "point" en français. Le point-virgule produit une pause naturelle de
-    # frontière de phrase sans jamais être prononcé par aucun moteur TTS.
-    # Les abréviations (M., etc.), acronymes (P.D.G.) et décimales (3.14) ont déjà
-    # été traités plus haut — il ne reste que des points de fin de phrase.
-    text = text.replace('.', ';')
+    # 9. Points de fin de phrase. Les abréviations (M., etc.), acronymes (P.D.G.)
+    # et décimales (3.14) ont déjà été traités plus haut — il ne reste qu'eux.
+    # On les GARDE. Comparatif sur Qwen3-TTS du 2026-09-20 (essais-ponctuation/) :
+    # avec « . » la phrase retombe (pente F0 finale −27/−20 Hz/s), avec « ; »
+    # elle reste en suspens (−9/+17 Hz/s), et « point » n'est jamais prononcé
+    # (retranscription Whisper large-v3). Choix validé à l'écoute.
+    # Le remplacement par « ; » visait XTTS (retiré) : plus aucun moteur n'y passe.
 
     # 10. Ponctuation doublée résiduelle
-    text = re.sub(r'([,;:!?])\s*\1+', r'\1', text)
+    text = re.sub(r'([.,;:!?])\s*\1+', r'\1', text)
 
     # 11. Espaces multiples
     text = re.sub(r'\s+', ' ', text).strip()
 
     # 12. S'assurer que le texte finit par une ponctuation (évite coupure abrupte)
-    if text and text[-1] not in '!?,;:':
-        text += ';'
+    if text and text[-1] not in '.!?,;:':
+        text += '.'
 
     return text
 
@@ -3958,7 +3604,7 @@ def synthesize_all(segments: list[DubSegment], profiles: dict[str, SpeakerProfil
     """
     Synthétise l'audio TTS pour chaque segment avec ajustement two-pass.
 
-    Le two-pass utilise le paramètre speed natif d'XTTS pour que chaque clip
+    Le two-pass ajuste la vitesse du moteur TTS pour que chaque clip
     tienne dans sa fenêtre temporelle. Ça remplace la majeure partie de la
     boucle de réécriture Claude (passe 6c) et élimine le time-stretching.
 
@@ -4029,7 +3675,17 @@ def synthesize_all(segments: list[DubSegment], profiles: dict[str, SpeakerProfil
                 available = next_start - seg.start - seg_lead_in - gap_sec
             else:
                 available = seg.duration - seg_lead_in
-            target_durations[seg.index] = max(available, 0.5)
+
+            # Le silence qui PRÉCÈDE le segment est du temps disponible : rien
+            # n'y est dit, ni dans l'original ni dans le doublage. L'ignorer
+            # revient à comprimer une phrase alors que la place existe juste
+            # avant. On s'autorise à en reprendre au plus MAX_BORROW_BEFORE_MS,
+            # sans jamais mordre sur le clip précédent.
+            prev_end = sorted_active[pos - 1][1].end if pos > 0 else 0.0
+            emprunt = min(MAX_BORROW_BEFORE_MS / 1000,
+                          max(0.0, seg.start - prev_end - gap_sec))
+            seg._borrow_ms = int(emprunt * 1000)
+            target_durations[seg.index] = max(available + emprunt, 0.5)
 
     t0 = time.time()
     success = 0
@@ -4054,9 +3710,9 @@ def synthesize_all(segments: list[DubSegment], profiles: dict[str, SpeakerProfil
             success += 1
             # Compter les two-pass effectifs (le print "Two-pass:" vient de synthesize())
             actual = _get_clip_duration(result)
-            if target_dur > 0 and abs(actual / target_dur - 1.0) > XTTS_SPEED_TOLERANCE:
+            if target_dur > 0 and abs(actual / target_dur - 1.0) > TTS_SPEED_TOLERANCE:
                 two_pass_count += 1
-            max_chars = ELEVENLABS_MAX_CHARS if isinstance(tts, ElevenLabsBackend) else XTTS_MAX_CHARS
+            max_chars = ELEVENLABS_MAX_CHARS if isinstance(tts, ElevenLabsBackend) else QWEN3TTS_MAX_CHARS
             if len(seg.speech_text) > max_chars:
                 n_parts = len(tts._split_text_for_tts(seg.speech_text))
                 print(f"      ✂️  seg {seg.index} : {len(seg.speech_text)} chars → {n_parts} parties")
@@ -4070,7 +3726,7 @@ def synthesize_all(segments: list[DubSegment], profiles: dict[str, SpeakerProfil
     if two_pass_count:
         print(f"   🏃 {two_pass_count} segments ajustés par two-pass speed")
 
-    # Trimmer tous les clips — supprime le silence parasite XTTS début/fin
+    # Trimmer tous les clips — supprime le silence parasite du TTS début/fin
     import soundfile as sf
     trimmed = 0
     for seg in segments:
@@ -4205,7 +3861,7 @@ def verify_and_fix_timing(segments: list, tts, client,
     Passe 6c — Vérifie les chevauchements réels entre clips TTS consécutifs.
 
     Stratégie en 4 étapes :
-      1. Round 1 : ajuster la vitesse XTTS (jusqu'à SPEED_RESCUE_MAX=1.40)
+      1. Round 1 : ajuster la vitesse du TTS (jusqu'à SPEED_RESCUE_MAX=1.40)
          → gratuit (pas d'appel API), qualité préservée par le modèle
       2. Round 2+ : réécriture Claude (cible ~95% longueur) + re-synthèse two-pass
       3. Round final agressif : réécriture drastique (cible 70% longueur)
@@ -4239,7 +3895,7 @@ def verify_and_fix_timing(segments: list, tts, client,
             if tts_dur < 0.1:
                 continue
             seg_lead_in = lead_in_sec if seg.is_sentence_start else 0.0
-            tts_end = seg.start + seg_lead_in + tts_dur
+            tts_end = seg.start - _emprunt_sec(seg) + seg_lead_in + tts_dur
             next_start = active[pos + 1][1].start
             overflow_ms = max(0.0, (tts_end - next_start) * 1000)
             # Tolérance proportionnelle à la durée du segment (segments courts = moins de tolérance)
@@ -4258,7 +3914,7 @@ def verify_and_fix_timing(segments: list, tts, client,
     print(f"   ⚠️  {len(overlaps)} chevauchements détectés (>{overlap_tolerance_ms:.0f}ms)")
 
     # ══════════════════════════════════════════════════════════════════════
-    # ROUND 1 : AJUSTEMENT PAR SPEED NATIF XTTS (pas d'appel Claude)
+    # ROUND 1 : AJUSTEMENT PAR SPEED DU TTS (pas d'appel Claude)
     # ══════════════════════════════════════════════════════════════════════
     speed_fixed = 0
     speed_failed = []
@@ -4270,13 +3926,13 @@ def verify_and_fix_timing(segments: list, tts, client,
 
         # Fenêtre disponible (avec marge pour éviter le chevauchement + gap inter-clips)
         seg_lead_in = lead_in_sec if seg.is_sentence_start else 0.0
-        available = next_start - seg.start - seg_lead_in - (overlap_tolerance_ms / 2000) - GAP_BETWEEN_CLIPS_MS / 1000
+        available = next_start - seg.start + _emprunt_sec(seg) - seg_lead_in - (overlap_tolerance_ms / 2000) - GAP_BETWEEN_CLIPS_MS / 1000
         available = max(available, 0.3)
 
         # Vitesse nécessaire pour tenir dans la fenêtre
         needed_speed = tts_dur / available
 
-        rescue_max = getattr(tts, 'speed_rescue_max', XTTS_SPEED_RESCUE_MAX)
+        rescue_max = getattr(tts, 'speed_rescue_max', TTS_SPEED_RESCUE_MAX)
         if needed_speed <= rescue_max:
             # ── Résolvable par speed seul ────────────────────────────
             clamped = min(needed_speed, rescue_max)
@@ -4337,10 +3993,10 @@ def verify_and_fix_timing(segments: list, tts, client,
             if not text:
                 continue
             seg_lead_in = lead_in_sec if seg.is_sentence_start else 0.0
-            available_dur = next_start - seg.start - seg_lead_in - (overlap_tolerance_ms / 2000) - GAP_BETWEEN_CLIPS_MS / 1000
+            available_dur = next_start - seg.start + _emprunt_sec(seg) - seg_lead_in - (overlap_tolerance_ms / 2000) - GAP_BETWEEN_CLIPS_MS / 1000
             available_dur = max(available_dur, 0.5)
             spk_cps = cps_avg.get(seg.speaker, global_cps)
-            # Viser un speed de ~1.15 après réécriture (confortable pour XTTS)
+            # Viser un speed de ~1.15 après réécriture (confortable pour le TTS)
             target_chars = int(available_dur * spk_cps * 1.15 * 0.95)
             target_chars = max(target_chars, 5)
             rewrite_items.append((seg.index, text, target_chars, len(text), overflow_ms))
@@ -4362,7 +4018,7 @@ def verify_and_fix_timing(segments: list, tts, client,
 
                     # Re-synthèse avec two-pass (speed auto-ajusté, trim inclus)
                     seg_lead_in = lead_in_sec if seg.is_sentence_start else 0.0
-                    available = next_start - seg.start - seg_lead_in - (overlap_tolerance_ms / 2000) - GAP_BETWEEN_CLIPS_MS / 1000
+                    available = next_start - seg.start + _emprunt_sec(seg) - seg_lead_in - (overlap_tolerance_ms / 2000) - GAP_BETWEEN_CLIPS_MS / 1000
                     result = tts.synthesize(new_text, seg.speaker, seg.tts_path,
                                            target_duration=max(available, 0.5))
                     if result:
@@ -4399,7 +4055,7 @@ def verify_and_fix_timing(segments: list, tts, client,
             if not text:
                 continue
             seg_lead_in = lead_in_sec if seg.is_sentence_start else 0.0
-            available_dur = next_start - seg.start - seg_lead_in - GAP_BETWEEN_CLIPS_MS / 1000
+            available_dur = next_start - seg.start + _emprunt_sec(seg) - seg_lead_in - GAP_BETWEEN_CLIPS_MS / 1000
             available_dur = max(available_dur, 0.3)
             spk_cps = cps_avg_final.get(seg.speaker, global_cps_final)
             # Cible agressive : viser speed=1.0 avec 70% de marge
@@ -4424,7 +4080,7 @@ def verify_and_fix_timing(segments: list, tts, client,
 
                     # Re-synthèse à speed rescue max pour garantir la durée
                     seg_lead_in = lead_in_sec if seg.is_sentence_start else 0.0
-                    available = next_start - seg.start - seg_lead_in - GAP_BETWEEN_CLIPS_MS / 1000
+                    available = next_start - seg.start + _emprunt_sec(seg) - seg_lead_in - GAP_BETWEEN_CLIPS_MS / 1000
                     result = tts.synthesize(new_text, seg.speaker, seg.tts_path,
                                            target_duration=max(available, 0.3))
                     if result:
@@ -5286,6 +4942,16 @@ def mix_audio_voiceover(segments: list[DubSegment], background_path: str,
                     lead_in = max(0, lead_in - excess)
 
             tts_start_ms = seg_start_ms + lead_in
+
+            # Emprunt du silence amont — uniquement à hauteur du débordement
+            # réel : un clip qui tient dans sa fenêtre n'est jamais déplacé,
+            # pour ne pas désynchroniser gratuitement.
+            emprunt_ms = getattr(seg, "_borrow_ms", 0)
+            if emprunt_ms > 0:
+                debordement = tts_dur_ms - (seg_end_ms - tts_start_ms)
+                if debordement > 0:
+                    tts_start_ms -= int(min(emprunt_ms, debordement))
+
             tts_end_ms = tts_start_ms + tts_dur_ms
             # Empêcher le débordement dans le segment suivant
             tts_end_ms = min(tts_end_ms, seg_end_ms + lead_out)
@@ -5365,7 +5031,9 @@ def mix_audio_voiceover(segments: list[DubSegment], background_path: str,
             continue
 
         new_start = int(prev_tts_end + target_gap)
-        new_start = max(new_start, int(seg.start * 1000))
+        # plancher = début du segment, moins l'emprunt amont autorisé
+        new_start = max(new_start,
+                        int(seg.start * 1000) - getattr(seg, "_borrow_ms", 0))
         if new_start < tts_start:
             seg._tts_place_ms = new_start
             active_tts[i] = [seg, new_start, tts_dur]
@@ -6214,8 +5882,7 @@ def run_tts_benchmark(segments: list, profiles: dict, work_dir: str,
                       base_name: str, target_lang: str,
                       source_lang: str = "en",
                       ref_voice: Optional[str] = None,
-                      xtts_speaker: Optional[str] = None,
-                      backend: str = "xtts",
+                      backend: str = "qwen3tts",
                       elevenlabs_voice: Optional[str] = None,
                       elevenlabs_model: Optional[str] = None,
                       ref_voices_dir: Optional[str] = None):
@@ -6246,7 +5913,7 @@ def run_tts_benchmark(segments: list, profiles: dict, work_dir: str,
     est_duration = total_chars / chars_per_sec
     test_spk = test_segments[0].speaker or next(iter(profiles.keys()), "SPEAKER_00")
 
-    backend_label = "ElevenLabs" if backend == "elevenlabs" else "XTTS v2"
+    backend_label = "ElevenLabs" if backend == "elevenlabs" else "Qwen3-TTS"
     first_text = test_segments[0].text_adapted or test_segments[0].text_tgt
     print(f"\n{'='*60}")
     print(f"🏁 BENCHMARK TTS — {backend_label}")
@@ -6266,7 +5933,6 @@ def run_tts_benchmark(segments: list, profiles: dict, work_dir: str,
         tts = create_tts_backend(ref_voice=ref_voice,
                                  target_lang=target_lang,
                                  source_lang=source_lang,
-                                 xtts_speaker=xtts_speaker,
                                  backend=backend,
                                  elevenlabs_voice=elevenlabs_voice,
                                  elevenlabs_model=elevenlabs_model,
@@ -6368,13 +6034,12 @@ def main():
         pass
 
     p = argparse.ArgumentParser(
-        description="Pipeline de doublage IA — XTTS v2 (clonage vocal multilingue)",
+        description="Pipeline de doublage IA — Qwen3-TTS / ElevenLabs (clonage vocal multilingue)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Exemples :
               python doubler.py interview.mp4                           # EN → FR, clonage vocal
               python doubler.py "https://youtube.com/watch?v=XXXXX"   # depuis YouTube
-              python doubler.py video.mp4 --xtts-speaker "Craig Gutsy"  # voix preset
               python doubler.py video.mp4 -s en -t es                   # EN → ES
               python doubler.py video.mp4 --segments segs.json          # reprendre traduction
               python doubler.py video.mp4 --keep-original 0.05          # 5% voix originale
@@ -6387,10 +6052,9 @@ def main():
               python doubler.py video.mp4 --vo-duck-db 12               # voix orig très présente
               python doubler.py video.mp4 --no-voiceover                # doublage pur (pas de VO)
               python doubler.py video.mp4 --ref-voice ref_fr.wav        # voix de référence externe
-              python doubler.py video.mp4 --benchmark                   # benchmark XTTS
+              python doubler.py video.mp4 --benchmark                   # benchmark TTS
               python doubler.py video.mp4 --onlydub                     # piste doublée MP3 seule
               python doubler.py video.mp4 --audio-only                  # MP3 séquentiel, sans calage temporel
-              python doubler.py --list-xtts-speakers                    # lister les voix preset
         """))
 
     p.add_argument("video", nargs="?", help="Fichier vidéo source ou lien YouTube")
@@ -6418,14 +6082,7 @@ def main():
                    help="Utiliser un fichier SRT traduit professionnellement comme base. "
                         "Les sous-titres sont alignés par timecode sur les segments WhisperX, "
                         "les passes de revue Claude (4c–4e) sont sautées.")
-    p.add_argument("--xtts-speaker", metavar="NAME",
-                   help="Voix preset XTTS v2 (ex: 'Craig Gutsy', 'Ana Florence'). "
-                        "Défaut: clonage vocal depuis les ref_clips extraits, "
-                        "ou preset par genre si aucune ref disponible. "
-                        "Liste complète : --list-xtts-speakers")
-    p.add_argument("--list-xtts-speakers", action="store_true",
-                   help="Afficher la liste des voix preset XTTS v2 et quitter")
-    p.add_argument("--tts", choices=["qwen3tts", "xtts", "elevenlabs"],
+    p.add_argument("--tts", choices=["qwen3tts", "elevenlabs"],
                    default="qwen3tts",
                    help="Backend TTS (défaut: qwen3tts)")
     p.add_argument("--elevenlabs-voice", metavar="VOICE_ID",
@@ -6537,22 +6194,6 @@ def main():
     if getattr(args, 'clone_original', False):
         args.ref_voices = None
 
-    # ── --list-xtts-speakers : afficher la liste et quitter ───────────────
-    if getattr(args, 'list_xtts_speakers', False):
-        print("\n🎤 Voix preset XTTS v2 (intégrées au modèle)")
-        print("=" * 55)
-        print("\n   ♀️  Voix féminines :")
-        for v in XTTS_VOICES_FEMALE:
-            print(f"      • {v}")
-        print("\n   ♂️  Voix masculines :")
-        for v in XTTS_VOICES_MALE:
-            print(f"      • {v}")
-        print(f"\n   Total : {len(XTTS_VOICES_FEMALE) + len(XTTS_VOICES_MALE)} voix")
-        print(f"\n   Usage : --tts xtts --xtts-speaker \"Craig Gutsy\"")
-        print(f"   Note  : sans --xtts-speaker, XTTS clone la voix")
-        print(f"           depuis les ref_clips extraits de la vidéo.\n")
-        sys.exit(0)
-
     # ── --list-elevenlabs-voices : afficher la liste et quitter ────────────
     if getattr(args, 'list_elevenlabs_voices', False):
         try:
@@ -6574,7 +6215,7 @@ def main():
         sys.exit(0)
 
     if not args.video:
-        p.error("l'argument video est requis (sauf avec --list-xtts-speakers / --list-elevenlabs-voices)")
+        p.error("l'argument video est requis (sauf avec --list-elevenlabs-voices)")
 
     # ── Téléchargement YouTube / Epoch Times / Apollo Health si lien ─────
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -6653,11 +6294,7 @@ def main():
             tts_label += " (clonage IVC)"
         tts_label += f" — modèle: {args.elevenlabs_model}"
     else:
-        tts_label = "XTTS v2"
-        if getattr(args, 'xtts_speaker', None):
-            tts_label += f" (preset: {args.xtts_speaker})"
-        else:
-            tts_label += " (clonage vocal)"
+        tts_label = "Qwen3-TTS (clonage vocal)"
     print(f"   TTS      : {tts_label}")
     print(f"   Sortie   : {output}")
     llm_label = f"Ollama {args.ollama_model}" if args.llm == "local" else f"Claude {CLAUDE_MODEL}"
@@ -6987,7 +6624,6 @@ def main():
             segments, profiles, work_dir, base, tgt_lang,
             source_lang=src_lang,
             ref_voice=getattr(args, 'ref_voice', None),
-            xtts_speaker=getattr(args, 'xtts_speaker', None),
             backend=args.tts,
             elevenlabs_voice=getattr(args, 'elevenlabs_voice', None),
             elevenlabs_model=getattr(args, 'elevenlabs_model', None),
@@ -7007,7 +6643,6 @@ def main():
     tts = create_tts_backend(ref_voice=getattr(args, 'ref_voice', None),
                              target_lang=tgt_lang,
                              source_lang=src_lang,
-                             xtts_speaker=getattr(args, 'xtts_speaker', None),
                              backend=args.tts,
                              elevenlabs_voice=getattr(args, 'elevenlabs_voice', None),
                              elevenlabs_model=getattr(args, 'elevenlabs_model', None),

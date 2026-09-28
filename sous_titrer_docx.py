@@ -21,7 +21,7 @@ from pathlib import Path
 # CONSTANTES (alignées sur traduire.py)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CLAUDE_MODEL = "claude-opus-4-5"
+CLAUDE_MODEL = "claude-opus-5"
 WHISPER_MODEL = "large-v3"
 
 # Ollama (LLM local — alternative gratuite à l'API Claude)
@@ -425,7 +425,7 @@ Réponds UNIQUEMENT en JSON — un array avec un objet par phrase anglaise :
                     max_tokens=16384,
                     messages=[{"role": "user", "content": prompt}]
                 )
-                raw = resp.content[0].text
+                raw = next((b.text for b in resp.content if b.type == "text"), "")
                 json_match = re.search(r'\[.*\]', raw, re.DOTALL)
                 if json_match:
                     window_results = json.loads(json_match.group())

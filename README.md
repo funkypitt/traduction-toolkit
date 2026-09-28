@@ -1,6 +1,6 @@
 # Toolkit de traduction et doublage IA pour vidéos
 
-Scripts Python indépendants pour **traduire, sous-titrer, doubler, résumer** et extraire des **clips viraux** à partir de vidéos dans n'importe quelle langue, avec WhisperX, Qwen3-TTS / XTTS v2, et un **LLM au choix** : 100 % **local** (Ollama, gratuit, par défaut) ou **Claude** (API Anthropic, via `--llm claude`).
+Scripts Python indépendants pour **traduire, sous-titrer, doubler, résumer** et extraire des **clips viraux** à partir de vidéos dans n'importe quelle langue, avec WhisperX, Qwen3-TTS, et un **LLM au choix** : 100 % **local** (Ollama, gratuit, par défaut) ou **Claude** (API Anthropic, via `--llm claude`).
 
 > 🆕 **LLM local par défaut.** Depuis 2026-06, les scripts utilisent un modèle local (Ollama) par défaut — aucune clé API requise. Ajoutez `--llm claude` pour utiliser l'API Anthropic. Voir [LLM : local ou Claude](#llm--local-ollama-ou-claude).
 >
@@ -25,7 +25,8 @@ L'installeur est **interactif** : il met en place ffmpeg, Miniconda, l'environne
 | `doubler-mp3-batch.py` | Doublage audio en lot (MP3/MP4 du dossier courant) | `fichier_fr.mp3` |
 | `resumer.py` | Résumé structuré d'une vidéo en PDF + EPUB | `video.pdf` + `video.epub` |
 | `clipper.py` | Extraction de clips viraux avec sous-titres karaoké | `clip.mp4` + `clip.txt` |
-| `gui.py` | Interface graphique web pour piloter tous les scripts | — |
+| `monter.py` | Montage au stabilo : on surligne le texte transcrit, le montage suit | `video_montage.mp4` ou `.mp3` |
+| `gui.py` | Panneau de contrôle web : tous les outils, montage compris | — |
 | `doctor.py` | Diagnostic et installation des dépendances | — |
 
 ## LLM : local (Ollama) ou Claude
@@ -36,7 +37,8 @@ Toutes les étapes d'IA textuelle (analyse, traduction, relecture, résumé) tou
 # Installer Ollama puis les modèles recommandés (cf. bench interne)
 curl -fsSL https://ollama.com/install.sh | sh
 ollama pull gemma4:31b    # traduction / doublage (meilleur français oral)
-ollama pull qwen3.6:27b   # résumé / sélection (raisonneur structuré)
+ollama pull qwen3.6:27b   # sélection de clips (raisonneur structuré)
+ollama pull mistral-small # résumé (défaut de resumer.py)
 
 # Utilisation (local = défaut)
 python traduire.py video.mp4                                    # LLM local
@@ -47,7 +49,8 @@ python traduire.py video.mp4 --ollama-model mistral-small:latest  # autre modèl
 | Tâche | Modèle local par défaut |
 |-------|-------------------------|
 | Traduction (sous-titres, doublage) | `gemma4:31b` |
-| Résumé, sélection de clips, alignement | `qwen3.6:27b` |
+| Résumé (`resumer.py`) | `mistral-small:latest` — tient entièrement en 24 Go de VRAM, ~5× plus rapide ; `--ollama-model qwen3.6:27b` pour le raisonneur dense |
+| Sélection de clips, alignement | `qwen3.6:27b` |
 
 > GPU NVIDIA recommandé (les modèles ~27–31B tiennent sur 24 Go de VRAM). Les tâches GPU sont **sérialisées** automatiquement (verrou global `~/.cache/traduction_gpu.lock`) pour éviter toute saturation.
 
@@ -101,7 +104,7 @@ export HF_TOKEN="hf_..."
 
 ### 3. ELEVENLABS_API_KEY (optionnel)
 
-Uniquement si vous utilisez le backend ElevenLabs (`--tts elevenlabs`) au lieu d'XTTS v2 dans les scripts de doublage. Non requis par défaut.
+Uniquement si vous utilisez le backend ElevenLabs (`--tts elevenlabs`) au lieu de Qwen3-TTS dans les scripts de doublage. Non requis par défaut.
 
 ```bash
 export ELEVENLABS_API_KEY="..."
@@ -169,7 +172,7 @@ pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install whisperx anthropic
 
 # Dépendances supplémentaires pour le doublage
-pip install demucs pydub soundfile numpy praat-parselmouth pyworld TTS
+pip install demucs pydub soundfile numpy praat-parselmouth pyworld
 
 # YouTube (optionnel, pour doubler.py)
 pip install yt-dlp
@@ -183,7 +186,14 @@ Plutôt que la ligne de commande, vous pouvez tout piloter depuis un **panneau d
 python gui.py        # puis ouvrez http://127.0.0.1:5005
 ```
 
-Il liste tous les scripts, propose des formulaires (champs, listes déroulantes, interrupteurs), un sélecteur de fichiers, le choix Claude/local + le modèle Ollama, un aperçu de la commande en direct et une console de sortie en streaming.
+Les outils y sont rangés par usage (traduire, monter, écrire, son). Chacun a son formulaire, avec sélecteur de fichiers, choix Claude ou modèle local, aperçu de la commande et console de sortie en direct. Le **montage au stabilo** s'ouvre dans le panneau lui-même.
+
+- Les valeurs par défaut, les choix et l'aide au survol viennent des scripts : le panneau ne passe en ligne de commande que ce qui s'écarte du défaut.
+- La console accepte une réponse quand un script pose une question (publication d'un extrait, liste de lecture).
+- « Choisir la voix de chaque locuteur » (doublage vidéo) ouvre une fenêtre où l'on écoute chaque locuteur et chaque voix avant de choisir.
+- Une page rechargée retrouve l'exécution en cours.
+
+`python gui.py --verifier` compare les formulaires aux options des scripts (option disparue, option sans champ).
 
 **Application de bureau (`.deb`)** — pour une vraie icône d'application (menu + dock) :
 
@@ -311,9 +321,31 @@ python clipper.py video.mp4 --resume video_clips.json --criteria "test"
 python clipper.py video.mp4 --criteria "moment drôle" --post
 ```
 
+### Montage au stabilo (monter.py)
+
+```bash
+# Ouvre la page http://127.0.0.1:5006 dans le navigateur
+python monter.py
+
+# Ouvre directement un fichier (vidéo ou enregistrement)
+python monter.py entretien.mp4
+```
+
+Le fichier est transcrit (WhisperX, horodatage mot par mot), le texte s'affiche à côté du lecteur, et l'on passe au stabilo ce que l'on garde :
+
+- **glisser** sur le texte surligne ; l'outil **Gomme** (ou Alt + glisser) efface ;
+- **clic** sur un mot : la lecture reprend à cet endroit ; **double clic** : la phrase entière ;
+- **clic** sur le premier mot puis **Maj + clic** sur le dernier : un long passage ;
+- les passages sans paroles (silence, musique) apparaissent dans le texte et se surlignent comme un mot ;
+- **Voir le montage** joue les passages à la suite, avant de produire quoi que ce soit.
+
+Le montage est produit dans `output/` : vidéo MP4 (fondu au noir à chaque coupe) ou son MP3/M4A/WAV. Chaque coupe est placée dans le creux le plus calme autour du passage, jamais au ras d'un mot. Le surlignage est enregistré au fur et à mesure : on retrouve son travail en rouvrant le fichier.
+
 ## Langues supportées
 
-Les scripts supportent toutes les langues prises en charge par WhisperX et XTTS v2, notamment :
+La transcription, la traduction et le sous-titrage supportent toutes les langues prises en charge par WhisperX. Le **doublage** local (Qwen3-TTS) est limité à 10 langues cibles : anglais, français, allemand, espagnol, italien, portugais, russe, chinois, japonais, coréen ; pour les autres, utiliser `--tts elevenlabs`.
+
+Langues de transcription, notamment :
 anglais, français, espagnol, allemand, italien, portugais, néerlandais, russe, japonais, chinois, coréen, arabe, hindi, turc, polonais, suédois, danois, norvégien, finnois, tchèque, roumain, hongrois, grec, hébreu, thaï, vietnamien, ukrainien, indonésien, malais, catalan, basque, galicien.
 
 ## Compatibilité (Linux / Windows / macOS)
@@ -341,7 +373,7 @@ La VRAM nécessaire dépend surtout du **moteur LLM** choisi (la traduction est 
 En mode **Claude**, le pic GPU vient de **WhisperX large-v3** (~10 Go) ; le doublage ajoute Demucs, la diarisation et le TTS (chacun plus modeste, mais plus de temps de calcul). En mode **local**, le pic vient du **modèle Ollama** (~20 Go mesurés pour un 27-31B).
 
 - **RAM** : 16 Go recommandé (8 Go minimum, serré pour le doublage d'une longue vidéo).
-- **Disque** : ~10 Go (WhisperX large-v3 + XTTS v2, téléchargés au 1er lancement) **+ ~36 Go** si vous installez les modèles Ollama locaux par défaut (gemma4 + qwen3.6).
+- **Disque** : ~10 Go (WhisperX large-v3 + Qwen3-TTS, téléchargés au 1er lancement) **+ ~36 Go** si vous installez les modèles Ollama locaux par défaut (gemma4 + qwen3.6).
 - **Sans GPU** : techniquement possible mais **très lent** — déconseillé au-delà de quelques minutes de vidéo.
 
 > 💡 Carte ≤ 16 Go : gardez le local avec un modèle plus léger (`--ollama-model mistral-small:latest`), ou passez le LLM sur **Claude** (`--llm claude`). En cas d'OOM sur WhisperX, réduisez `WHISPER_BATCH_SIZE` (voir [Dépannage](#dépannage)).
@@ -373,5 +405,5 @@ video_dubbing_work/                # dossier de travail (segments, audio interm�
 | Diarisation échoue | Vérifier que `HF_TOKEN` est défini et que les modèles Pyannote sont acceptés sur HuggingFace |
 | `ffmpeg: subtitle filter not found` | Réinstaller ffmpeg avec libass : `sudo apt install ffmpeg libavcodec-extra` |
 | `yt-dlp` ne fonctionne pas | Mettre à jour : `pip install -U yt-dlp` |
-| Premier lancement très long | Normal — les modèles WhisperX (~5 Go) et XTTS v2 (~2 Go) se téléchargent |
+| Premier lancement très long | Normal — les modèles WhisperX (~5 Go) et Qwen3-TTS se téléchargent |
 | Traitement interrompu | Utiliser `--resume segments.json` (traduire.py) ou `--segments segments.json` (doublage) |
