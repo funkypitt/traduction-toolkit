@@ -60,6 +60,10 @@ PORT = 5006
 # « sans paroles », visible et surlignable comme un mot (musique, silence, ou
 # passage que WhisperX a laissé tomber).
 SEUIL_PAUSE = 2.0
+# Au tout début et à la toute fin du fichier, le repère apparaît dès SEUIL_BORD :
+# c'est là que traînent les bruits de micro qu'on veut pouvoir retirer.
+SEUIL_BORD = 0.3
+VERSION_JETONS = 2          # 2 : repères de début et de fin
 
 FONDU_DEFAUT = 0.5          # secondes
 FONDU_MAX = 3.0
@@ -202,6 +206,11 @@ def construire_jetons(segments, duree: float) -> list:
             if texte:
                 mots.append([texte, float(w["start"]), float(w["end"]), k])
 
+    return jetons_depuis_mots(mots, duree)
+
+
+def jetons_depuis_mots(mots: list, duree: float) -> list:
+    """Mots [texte, début, fin, phrase] → jetons, passages sans paroles compris."""
     # Horodatages strictement ordonnés, sans chevauchement
     prec = 0.0
     for m in mots:
@@ -225,7 +234,19 @@ def construire_jetons(segments, duree: float) -> list:
         curseur = m[2]
     if duree - curseur >= SEUIL_PAUSE:
         jetons.append([None, round(curseur, 3), round(duree, 3), -1])
-    return jetons
+    return poser_les_bords(jetons, duree)[0]
+
+
+def poser_les_bords(jetons: list, duree: float) -> tuple:
+    """Ajoute le repère sans paroles du début et celui de la fin quand ils
+    manquent. Retourne (jetons, décalage des numéros : 0 ou 1)."""
+    decalage = 0
+    if jetons and jetons[0][0] is not None and jetons[0][1] >= SEUIL_BORD:
+        jetons = [[None, 0.0, jetons[0][1], -1]] + jetons
+        decalage = 1
+    if jetons and jetons[-1][0] is not None and duree - jetons[-1][2] >= SEUIL_BORD:
+        jetons = jetons + [[None, jetons[-1][2], round(duree, 3), -1]]
+    return jetons, decalage
 
 
 def tache_transcrire(dossier: str, langue: str):
@@ -235,6 +256,24 @@ def tache_transcrire(dossier: str, langue: str):
     if not projet:
         print(f"❌ Projet illisible : {dossier}")
         sys.exit(1)
+
+    if projet.get("reprise"):
+        try:
+            jetons = reprendre_texte(dossier, projet, projet["reprise"])
+        except Exception as ex:
+            jetons = None
+            print(f"⚠️  Le texte déjà produit n'a pas pu être repris ({ex}).")
+        if jetons:
+            ecrire_json(dossier / "transcription.json",
+                        {"version": VERSION_JETONS,
+                         "langue": projet["reprise"].get("langue", ""),
+                         "origine": projet["reprise"]["genre"],
+                         "estime": projet["reprise"]["genre"] != "origine",
+                         "jetons": jetons})
+            n_mots = sum(1 for j in jetons if j[0] is not None)
+            print(f"   ✅ Texte prêt : {n_mots} mots, repris sans nouvelle transcription")
+            return
+        print("🎙️  Le son est transcrit à la place.")
 
     from resumer import extract_audio, transcribe_whisperx
 
@@ -265,9 +304,464 @@ def tache_transcrire(dossier: str, langue: str):
 
     jetons = construire_jetons(segments, projet.get("duree") or 0.0)
     ecrire_json(dossier / "transcription.json",
-                {"langue": detectee, "jetons": jetons})
+                {"version": VERSION_JETONS, "langue": detectee, "jetons": jetons})
     n_mots = sum(1 for j in jetons if j[0] is not None)
     print(f"   ✅ Texte prêt : {n_mots} mots")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REPRISE D'UN TEXTE DÉJÀ PRODUIT (sous-titrage, doublage)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Une vidéo sortie de traduire.py ou de doubler.py a déjà son texte, et c'est le
+# texte traduit qu'on veut lire en montant : celui des sous-titres, ou celui
+# que dit la voix doublée. Il est repris des fichiers de travail, sans WhisperX.
+#
+# Ce qui est mesuré : les moments où la voix parle (horodatage mot par mot de
+# la voix d'origine pour des sous-titres ; place réelle de chaque clip de
+# doublage, retrouvée dans le son du fichier, et pauses de ce clip).
+# Ce qui est estimé : la place de chaque mot traduit, réparti sur ces moments à
+# la mesure de sa longueur, les fins de phrase calées sur les pauses.
+
+RE_LANGUE = r"[a-z]{2,3}"
+PAUSE_PAROLE = 0.15         # en dessous, un creux fait partie de la parole
+PAUSE_REPERE = 0.25         # une pause sert de repère aux fins de phrase à partir de là
+CORRELATION_MIN = 0.35      # en dessous, le clip n'est pas dans le son du fichier
+RETROUVES_MIN = 0.5         # part des clips à retrouver pour croire au rapprochement
+# Autour d'un mot dont la place est estimée, le point calme se cherche aussi
+# un peu à l'intérieur du mot.
+JEU_ESTIME = 0.25
+# Doublage : la voix d'origine s'entend seule un instant avant la voix doublée,
+# et un instant après. Ces instants vont avec la phrase ; au-delà, ce qui reste
+# de la voix d'origine devient un passage à part, qu'on garde ou qu'on retire.
+AVANT_DOUBLAGE = 3.0
+APRES_DOUBLAGE = 1.5
+FIN_DE_PHRASE = ".!?…"
+PONCTUATION = FIN_DE_PHRASE + ",;:—–"
+FERMANTS = "»\"”’')]   "
+
+
+def lire_segments(chemin) -> list:
+    """segments.json de traduire.py ou de doubler.py."""
+    data = lire_json(chemin)
+    if isinstance(data, dict):
+        data = data.get("segments")
+    segments = []
+    for d in data or []:
+        try:
+            debut, fin = float(d["start"]), float(d["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if fin <= debut:
+            continue
+        segments.append({
+            "index": d.get("index"), "d": debut, "f": fin,
+            "source": (d.get("text") or "").strip(),
+            "traduit": (d.get("text_tgt") or d.get("text_fr") or "").strip(),
+            "dit": (d.get("text_adapted") or d.get("text_tgt")
+                    or d.get("text_fr") or d.get("text") or "").strip(),
+            "mots": d.get("words") or [],
+            "locuteur": d.get("speaker") or ""})
+    segments.sort(key=lambda g: g["d"])
+    return segments
+
+
+def lire_srt(chemin) -> list:
+    """Sous-titres SRT → [(début, fin, texte)]."""
+    try:
+        brut = Path(chemin).read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return []
+    temps = r"(\d+):(\d\d):(\d\d)[,.](\d{1,3})"
+    repliques = []
+    for bloc in re.split(r"\n\s*\n", brut.replace("\r", "")):
+        m = re.search(temps + r"\s*-->\s*" + temps + r"[^\n]*\n(.*)", bloc, re.S)
+        if not m:
+            continue
+        g = m.groups()
+        debut = int(g[0]) * 3600 + int(g[1]) * 60 + int(g[2]) + int(g[3].ljust(3, "0")) / 1000
+        fin = int(g[4]) * 3600 + int(g[5]) * 60 + int(g[6]) + int(g[7].ljust(3, "0")) / 1000
+        texte = " ".join(re.sub(r"<[^>]+>|\{\\[^}]*\}", "", g[8]).split())
+        if texte and fin > debut:
+            repliques.append((debut, fin, texte))
+    repliques.sort()
+    return repliques
+
+
+def chercher_texte_existant(chemin: str, duree: float):
+    """Les fichiers de travail qui vont avec ce fichier, d'après son nom :
+    {genre, segments, srt, clips, langue}, ou None. Genres : « doublage »
+    (vidéo de doubler.py), « sous-titres » (vidéo de traduire.py), « origine »
+    (la vidéo de départ : sa transcription existe déjà, mot par mot)."""
+    nom = Path(chemin).stem
+    trouve = None
+    m = re.fullmatch(rf"(.+)_dubbed_({RE_LANGUE})", nom)
+    if m:
+        travail = WORK_DIR / f"{m.group(1)}_dubbing_work"
+        if (travail / "segments.json").is_file():
+            trouve = {"genre": "doublage", "segments": str(travail / "segments.json"),
+                      "clips": str(travail), "langue": m.group(2)}
+    m = re.fullmatch(rf"(.+)_({RE_LANGUE})", nom)
+    if m and not trouve:
+        base = m.group(1)
+        segments = WORK_DIR / base / f"{base}_segments.json"
+        if segments.is_file():
+            srt = [c for c in (Path(chemin).with_suffix(".srt"), OUTPUT_DIR / f"{nom}.srt")
+                   if c.is_file()]
+            trouve = {"genre": "sous-titres", "segments": str(segments),
+                      "srt": str(srt[0]) if srt else "", "langue": m.group(2)}
+    if not trouve:
+        for segments in (WORK_DIR / nom / f"{nom}_segments.json",
+                         WORK_DIR / f"{nom}_dubbing_work" / "segments.json"):
+            if segments.is_file():
+                trouve = {"genre": "origine", "segments": str(segments), "langue": ""}
+                break
+    if not trouve:
+        return None
+
+    # Le même nom ne suffit pas : le texte doit tenir dans la durée du fichier
+    segments = lire_segments(trouve["segments"])
+    if not segments or (duree > 0 and segments[-1]["f"] > duree + 1.0):
+        return None
+    if trouve["genre"] == "origine":
+        if not any(g["mots"] for g in segments):
+            return None
+    elif not any(g["dit" if trouve["genre"] == "doublage" else "traduit"] for g in segments):
+        return None
+    return trouve
+
+
+def moments_de_parole(x, sr: int) -> list:
+    """Signal d'une voix seule → [[début, fin], …] en secondes : les moments
+    où elle parle, séparés par ses pauses."""
+    import numpy as np
+
+    total = len(x) / float(sr)
+    pas = max(1, int(sr * 0.010))
+    n = len(x) // pas
+    if n < 5:
+        return [[0.0, total]]
+    e = np.sqrt((x[:n * pas].reshape(n, pas) ** 2).mean(axis=1))
+    fort = float(np.percentile(e, 95))
+    if fort <= 1e-5:
+        return [[0.0, total]]
+    parle = e > max(fort * 0.03, 1e-4)          # 30 dB sous les passages forts
+    moments = []
+    debut = None
+    for i in range(n + 1):
+        actif = i < n and bool(parle[i])
+        if actif and debut is None:
+            debut = i
+        elif not actif and debut is not None:
+            a, b = debut * pas / sr, i * pas / sr
+            if moments and a - moments[-1][1] < PAUSE_PAROLE:
+                moments[-1][1] = b
+            elif b - a >= 0.03 or not moments:
+                moments.append([a, b])
+            debut = None
+    return moments or [[0.0, total]]
+
+
+def reunir_les_mots(mots: list) -> list:
+    """Mots horodatés d'une voix [(début, fin), …] → moments de parole."""
+    moments = []
+    for a, b in sorted(mots):
+        if b <= a:
+            continue
+        if moments and a - moments[-1][1] < PAUSE_PAROLE:
+            moments[-1][1] = max(moments[-1][1], b)
+        else:
+            moments.append([a, b])
+    return moments
+
+
+def mots_du_texte(texte: str) -> list:
+    """Les mots d'un texte ; une ponctuation isolée par une espace (« mot ? »,
+    guillemets français) reste avec son mot."""
+    mots, ouvrant = [], ""
+    for m in texte.split():
+        if not any(c.isalnum() for c in m):
+            if m[0] in "«“([¿¡" or not mots:
+                ouvrant += m + "\u00a0"
+            else:
+                mots[-1] += "\u00a0" + m
+            continue
+        mots.append(ouvrant + m)
+        ouvrant = ""
+    return mots
+
+
+def _force(mot: str) -> int:
+    """2 : le mot finit une phrase ; 1 : il porte une autre ponctuation."""
+    nu = mot.rstrip(FERMANTS)
+    if nu and nu[-1] in FIN_DE_PHRASE:
+        return 2
+    return 1 if nu and nu[-1] in PONCTUATION else 0
+
+
+def _etaler(mots: list, poids: list, moments: list) -> list:
+    """Répartit des mots sur le temps parlé de quelques moments."""
+    parle = sum(b - a for a, b in moments)
+    total = float(sum(poids))
+    if parle <= 0 or total <= 0:
+        return []
+
+    def instant(position, fin_de_mot):
+        # position dans le temps parlé → instant ; à la frontière de deux
+        # moments, un début de mot va au moment suivant, une fin au précédent
+        reste = position
+        for k, (a, b) in enumerate(moments):
+            longueur = b - a
+            if reste < longueur or (fin_de_mot and reste <= longueur + 1e-9) \
+                    or k == len(moments) - 1:
+                return a + min(max(reste, 0.0), longueur)
+            reste -= longueur
+        return moments[-1][1]
+
+    places, cumul = [], 0.0
+    for mot, w in zip(mots, poids):
+        d = instant(cumul / total * parle, False)
+        cumul += w
+        f = instant(cumul / total * parle, True)
+        places.append([mot, d, max(f, d)])
+    return places
+
+
+def repartir(mots: list, moments: list) -> list:
+    """Place des mots d'un texte sur les moments où la voix parle. Chaque mot
+    reçoit une part du temps parlé à la mesure de sa longueur ; les pauses de
+    la voix sont attribuées aux ponctuations les plus proches, et le texte est
+    réparti entre ces repères. Retourne [[mot, début, fin], …]."""
+    moments = [[a, b] for a, b in moments if b > a]
+    if not mots or not moments:
+        return []
+    poids = [len(m) + 1 for m in mots]
+    total = float(sum(poids))
+    parle = sum(b - a for a, b in moments)
+
+    # Frontières de mots qui portent une ponctuation : position attendue dans
+    # le temps parlé
+    frontieres, cumul = [], 0.0
+    for k in range(1, len(mots)):
+        cumul += poids[k - 1]
+        force = _force(mots[k - 1])
+        if force:
+            frontieres.append((k, cumul / total * parle, force))
+
+    # Pauses de la voix, les plus longues d'abord
+    pauses, cumul = [], 0.0
+    for j in range(len(moments) - 1):
+        cumul += moments[j][1] - moments[j][0]
+        longueur = moments[j + 1][0] - moments[j][1]
+        if longueur >= PAUSE_REPERE:
+            pauses.append((longueur, j, cumul))
+    pauses.sort(reverse=True)
+
+    tolerance = max(1.0, 0.2 * parle)
+    reperes = []                    # (frontière de mots, pause) : paires retenues
+    for _, j, position in pauses:
+        mieux = None
+        for k, attendue, force in frontieres:
+            ecart = abs(attendue - position)
+            if ecart > tolerance or any(k == k2 or (k < k2) != (j < j2)
+                                        for k2, j2 in reperes):
+                continue
+            note = ecart + (0.0 if force == 2 else 0.6)
+            if mieux is None or note < mieux[0]:
+                mieux = (note, k)
+        if mieux:
+            reperes.append((mieux[1], j))
+    reperes.sort()
+
+    places = []
+    k0, j0 = 0, 0
+    for k, j in reperes + [(len(mots), len(moments) - 1)]:
+        places += _etaler(mots[k0:k], poids[k0:k], moments[j0:j + 1])
+        k0, j0 = k, j + 1
+    return places
+
+
+def extraire_son(source: str, wav: Path):
+    """Le son du fichier en WAV 16 kHz mono (le même que pour une transcription)."""
+    if wav.exists():
+        return
+    tmp = wav.with_name("audio16k.tmp.wav")
+    r = subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", source, "-vn",
+                        "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", str(tmp)],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not tmp.exists():
+        raise RuntimeError("le son du fichier n'a pas pu être lu")
+    os.replace(tmp, wav)
+
+
+def lire_clip(chemin: Path, sr: int):
+    """Un clip de doublage, en mono, à la fréquence du son de travail."""
+    import numpy as np
+    import soundfile as sf
+    from math import gcd
+    from scipy.signal import resample_poly
+
+    x, f = sf.read(str(chemin), dtype="float32", always_2d=True)
+    x = x.mean(axis=1)
+    if f != sr and len(x):
+        g = gcd(int(f), int(sr))
+        x = resample_poly(x, sr // g, int(f) // g).astype(np.float32)
+    return x
+
+
+def situer_clip(son, clip, sr: int, de: float, a: float) -> tuple:
+    """Cherche le clip dans le son du fichier, entre `de` et `a` secondes.
+    Retourne (début du clip en secondes, corrélation de 0 à 1)."""
+    import numpy as np
+    from scipy.signal import fftconvolve
+
+    i0 = max(0, int(de * sr))
+    zone = son[i0:min(len(son), int(a * sr) + len(clip))]
+    if len(clip) > len(zone):
+        clip = clip[:len(zone)]             # clip coupé par la fin du fichier
+    if len(clip) < sr * 0.2:
+        return de, 0.0
+    croise = fftconvolve(zone, clip[::-1], mode="valid")
+    energie = fftconvolve(zone * zone, np.ones(len(clip), dtype=np.float32), mode="valid")
+    norme = np.sqrt(np.maximum(energie, 1e-9) * max(float((clip * clip).sum()), 1e-9))
+    note = croise / norme
+    k = int(np.argmax(note))
+    return (i0 + k) / float(sr), float(note[k])
+
+
+def _phrases(mots: list) -> list:
+    """Numérote les phrases : mots [texte, début, fin, locuteur] → même liste
+    avec, à la place du locuteur, le numéro de la phrase."""
+    numero, prec = 0, None
+    for k, m in enumerate(mots):
+        if k and (m[3] != prec or _force(mots[k - 1][0]) == 2):
+            numero += 1
+        prec = m[3]
+        m[3] = numero
+    return mots
+
+
+def jetons_du_doublage(dossier: Path, projet: dict, reprise: dict) -> list:
+    import numpy as np
+    import soundfile as sf
+
+    segments = [g for g in lire_segments(reprise["segments"]) if g["dit"]]
+    son, sr = sf.read(str(dossier / "audio16k.wav"), dtype="float32")
+    if son.ndim > 1:
+        son = son.mean(axis=1)
+    travail = Path(reprise.get("clips") or "")
+
+    mots, cherches, retrouves, fin_prec = [], 0, 0, 0.0
+    for g in segments:
+        clip = None
+        for sous_dossier in ("tts_normalized", "tts_clips"):
+            c = travail / sous_dossier / f"seg_{int(g['index'] or 0):04d}.wav"
+            if c.is_file():
+                clip = c
+                break
+        moments = None
+        if clip is not None:
+            x = lire_clip(clip, sr)
+            if len(x) >= sr * 0.2:
+                cherches += 1
+                # Le mixage déplace les clips : un peu plus tard quand le
+                # précédent déborde, bien plus tôt quand il colle la suite
+                # d'une phrase au clip d'avant.
+                de = max(0.0, min(g["d"] - 5.0, fin_prec - 1.0))
+                debut, note = situer_clip(son, x, sr, max(de, g["d"] - 60.0), g["f"] + 5.0)
+                if note >= CORRELATION_MIN:
+                    retrouves += 1
+                    moments = [[debut + a, debut + b] for a, b in moments_de_parole(x, sr)]
+                    fin_prec = moments[-1][1]
+        if moments is None:
+            moments = [[g["d"], g["f"]]]
+        places = repartir(mots_du_texte(g["dit"]), moments)
+        if not places:
+            continue
+        if 0 < places[0][1] - g["d"] <= AVANT_DOUBLAGE:
+            places[0][1] = g["d"]
+        if 0 < g["f"] - places[-1][2] <= APRES_DOUBLAGE:
+            places[-1][2] = g["f"]
+        mots += [[m, d, f, g["locuteur"]] for m, d, f in places]
+
+    if cherches and retrouves < cherches * RETROUVES_MIN:
+        raise RuntimeError(f"le doublage n'est pas celui de ce fichier : {retrouves} "
+                           f"clip(s) retrouvé(s) dans le son sur {cherches}")
+    if cherches:
+        print(f"   📍 {retrouves} clip(s) de doublage sur {cherches} retrouvé(s) dans le son")
+    else:
+        print("   ⚠️  Clips de doublage absents : le texte est placé d'après "
+              "l'horodatage de la voix d'origine")
+    return jetons_depuis_mots(_phrases(mots), projet.get("duree") or 0.0)
+
+
+def jetons_des_sous_titres(projet: dict, reprise: dict) -> list:
+    segments = lire_segments(reprise["segments"])
+    repliques = lire_srt(reprise["srt"]) if reprise.get("srt") else []
+    if not repliques:
+        repliques = [(g["d"], g["f"], g["traduit"]) for g in segments if g["traduit"]]
+
+    # Chaque mot de la voix d'origine va à la réplique qui le contient, sinon
+    # à la plus proche (ce qui n'a pas été traduit n'est à aucune réplique)
+    voix = []
+    for g in segments:
+        if not g["traduit"]:
+            continue
+        for w in g["mots"]:
+            try:
+                voix.append((float(w["start"]), float(w["end"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    voix.sort()
+    parts = [[] for _ in repliques]
+    r = 0
+    for a, b in voix:
+        milieu = (a + b) / 2.0
+        while r + 1 < len(repliques) and milieu >= repliques[r][1] and \
+                abs(milieu - repliques[r + 1][0]) <= abs(milieu - repliques[r][1]):
+            r += 1
+        if repliques:
+            parts[r].append((a, b))
+
+    mots = []
+    for (debut, fin, texte), part in zip(repliques, parts):
+        moments = reunir_les_mots(part) or [[debut, fin]]
+        mots += [[m, d, f, ""] for m, d, f in repartir(mots_du_texte(texte), moments)]
+    return jetons_depuis_mots(_phrases(mots), projet.get("duree") or 0.0)
+
+
+def jetons_d_origine(projet: dict, reprise: dict) -> list:
+    from types import SimpleNamespace
+
+    segments = [SimpleNamespace(words=g["mots"], start=g["d"], end=g["f"], text=g["source"])
+                for g in lire_segments(reprise["segments"]) if g["mots"] or g["source"]]
+    return construire_jetons(segments, projet.get("duree") or 0.0)
+
+
+def reprendre_texte(dossier: Path, projet: dict, reprise: dict) -> list:
+    """Les jetons du projet, à partir de ce que traduire.py ou doubler.py ont
+    laissé. Le son de travail est extrait au passage : le calcul des points de
+    coupe en a besoin."""
+    noms = {"doublage": "texte du doublage", "sous-titres": "texte des sous-titres",
+            "origine": "transcription déjà faite"}
+    print(f"📄 Reprise : {noms.get(reprise['genre'], reprise['genre'])}")
+    extraire_son(projet["source"], dossier / "audio16k.wav")
+    if reprise["genre"] == "doublage":
+        return jetons_du_doublage(dossier, projet, reprise)
+    if reprise["genre"] == "sous-titres":
+        return jetons_des_sous_titres(projet, reprise)
+    return jetons_d_origine(projet, reprise)
+
+
+def plages_depuis_temps(jetons: list, temps: list) -> list:
+    """Un surlignage donné en secondes → plages de jetons (quand le texte
+    change, ce qui était surligné le reste)."""
+    choisis = []
+    for i, j in enumerate(jetons):
+        milieu = (j[1] + j[2]) / 2.0
+        if any(a <= milieu <= b for a, b in temps):
+            choisis.append([i, i])
+    return [list(p) for p in plages_propres(choisis, len(jetons))]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -348,10 +842,12 @@ def complement(propres: list, n: int) -> list:
 
 
 def calculer_coupes(dossier: Path, jetons: list, plages: list, fondu: float,
-                    duree: float, inverse: bool = False) -> list:
+                    duree: float, inverse: bool = False, estime: bool = False) -> list:
     """Plages de jetons [i, j] → morceaux gardés {d, f, fi, fo, vi, vo, plage},
     en secondes. Avec `inverse`, les plages sont ce qu'on retire : on garde tout
-    le reste, du début du fichier à sa fin."""
+    le reste, du début du fichier à sa fin. Avec `estime`, la place des mots
+    n'est pas mesurée (texte repris d'une traduction) : le point calme se
+    cherche des deux côtés de la frontière."""
     n = len(jetons)
     propres = plages_propres(plages, n)
     if inverse:
@@ -365,6 +861,7 @@ def calculer_coupes(dossier: Path, jetons: list, plages: list, fondu: float,
     # laisse déborder d'autant sur le voisin pour ne pas rogner le mot gardé ;
     # en coupant, on ne déborde pas, pour ne rien laisser du mot retiré.
     debord = 0.0 if inverse else 0.04
+    jeu = JEU_ESTIME if estime else 0.0
 
     son = None
     wav = dossier / "audio16k.wav"
@@ -389,10 +886,12 @@ def calculer_coupes(dossier: Path, jetons: list, plages: list, fondu: float,
                 k += 1
             deb_suiv = jetons[k][1] if k < n else fin_media
 
-            a = max(0.0, fin_prec - debord, d_brut - portee)
-            d = point_calme(son, min(a, d_brut), d_brut, d_brut - cible_av)
-            b = min(fin_media, deb_suiv + debord, f_brut + portee)
-            f = point_calme(son, f_brut, max(b, f_brut), f_brut + cible_ap)
+            a = max(0.0, fin_prec - debord - jeu, d_brut - portee)
+            d = point_calme(son, min(a, d_brut), min(d_brut + jeu, f_brut),
+                            d_brut - cible_av)
+            b = min(fin_media, deb_suiv + debord + jeu, f_brut + portee)
+            f = point_calme(son, max(f_brut - jeu, d), max(b, f_brut),
+                            f_brut + cible_ap)
             if inverse and i == 0:
                 d = 0.0
             if inverse and j == n - 1:
@@ -437,14 +936,231 @@ class Annule(Exception):
 
 
 def chemin_de_sortie(source: str, ext: str) -> Path:
+    """Un nom libre pour le montage ET ses deux journaux : un même nom ne sert
+    qu'à une production (montage.mp4, montage.txt, montage.edl)."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     base = Path(source).stem
-    sortie = OUTPUT_DIR / f"{base}_montage.{ext}"
-    k = 2
-    while sortie.exists():
-        sortie = OUTPUT_DIR / f"{base}_montage-{k}.{ext}"
+    k = 1
+    while True:
+        nom = f"{base}_montage" + (f"-{k}" if k > 1 else "")
+        if not any((OUTPUT_DIR / f"{nom}.{e}").exists()
+                   for e in ("mp4", "mp3", "m4a", "wav", "txt", "edl")):
+            return OUTPUT_DIR / f"{nom}.{ext}"
         k += 1
-    return sortie
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# JOURNAL DES COUPES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _hmsm(t: float) -> str:
+    ms = int(round(max(0.0, t) * 1000))
+    h, r = divmod(ms, 3600000)
+    m, r = divmod(r, 60000)
+    sec, ms = divmod(r, 1000)
+    return f"{h:02d}:{m:02d}:{sec:02d}.{ms:03d}"
+
+
+def _sec(t: float, chiffres: int = 3) -> str:
+    """Une durée en secondes, écrite à la française."""
+    return f"{t:.{chiffres}f}".replace(".", ",") + " s"
+
+
+def _texte(jetons: list, a: int, b: int) -> str:
+    mots = []
+    for t in jetons[max(0, a):b + 1]:
+        mots.append(t[0] if t[0] is not None
+                    else f"[{_sec(t[2] - t[1], 1)} sans paroles]")
+    return " ".join(mots)
+
+
+def _paragraphe(texte: str, retrait: str) -> list:
+    import textwrap
+    return textwrap.wrap(texte, width=72, initial_indent=retrait,
+                         subsequent_indent=retrait) or [retrait + "(sans paroles)"]
+
+
+def journal_texte(sortie: Path, projet: dict, jetons: list, coupes: list,
+                  mode: str, fondu: float, fondu_image: bool, fmt: str) -> str:
+    """Le journal lisible : chaque morceau gardé, et ce qui est retiré autour."""
+    duree = projet.get("duree") or 0.0
+    garde = sum(c["f"] - c["d"] for c in coupes)
+    video = fmt == "mp4"
+    L = ["JOURNAL DES COUPES", "=" * 18, "",
+         f"Fichier d'origine : {projet['source']}",
+         f"                    durée {_hmsm(duree)}",
+         f"Montage produit   : {sortie}",
+         f"                    durée {_hmsm(garde)}, le "
+         + time.strftime("%Y-%m-%d à %H:%M"),
+         "Réglage           : le texte marqué est "
+         + ("retiré, tout le reste est gardé" if mode == "couper" else "gardé"),
+         f"Fondu demandé     : {_sec(fondu, 1)} (le fondu du son ne mord jamais sur un mot :",
+         "                    il est plus court quand la coupe est serrée)"]
+    if video:
+        L.append("Image             : " + (
+            "coupes franches" if not (fondu_image and fondu > 0) else
+            f"fondu au noir là où {_sec(SEUIL_FONDU_IMAGE, 0)} ou plus est retirée, "
+            "coupe franche ailleurs"))
+    L += [f"Morceaux gardés   : {len(coupes)}",
+          f"Retiré en tout    : {_hmsm(max(0.0, duree - garde))}", "",
+          "Les instants sont en heures:minutes:secondes.millièmes.", ""]
+
+    def retire(debut, fin, a, b):
+        if fin - debut < 0.05:
+            return
+        L.append(f"  RETIRÉ  {_hmsm(debut)} → {_hmsm(fin)}   ({_sec(fin - debut)})")
+        L.extend(_paragraphe(_texte(jetons, a, b), "    ") if a <= b
+                 else ["    (sans paroles)"])
+        L.append("")
+
+    n = len(jetons)
+    retire(0.0, coupes[0]["d"], 0, coupes[0]["plage"][0] - 1)
+    position = 0.0
+    for k, c in enumerate(coupes):
+        dur = c["f"] - c["d"]
+        L.append("-" * 72)
+        L.append(f"MORCEAU {k + 1}")
+        L.append(f"  dans l'origine   {_hmsm(c['d'])} → {_hmsm(c['f'])}   ({_sec(dur)})")
+        L.append(f"  dans le montage  {_hmsm(position)} → {_hmsm(position + dur)}")
+        L.append(f"  son              fondu d'entrée {_sec(c['fi'])}, "
+                 f"fondu de sortie {_sec(c['fo'])}")
+        if video:
+            if fondu_image and fondu > 0:
+                L.append("  image            "
+                         + ("entrée en fondu" if c.get("vi", True) else "entrée franche")
+                         + ", "
+                         + ("sortie en fondu au noir" if c.get("vo", True)
+                            else "sortie franche"))
+            else:
+                L.append("  image            entrée et sortie franches")
+        L.append("  texte")
+        L.extend(_paragraphe(_texte(jetons, c["plage"][0], c["plage"][1]), "    "))
+        L.append("")
+        position += dur
+        if k + 1 < len(coupes):
+            retire(c["f"], coupes[k + 1]["d"], c["plage"][1] + 1,
+                   coupes[k + 1]["plage"][0] - 1)
+    retire(coupes[-1]["f"], duree, coupes[-1]["plage"][1] + 1, n - 1)
+    return "\n".join(L) + "\n"
+
+
+def _code_temporel(images: int, base: int, saute: bool) -> str:
+    """Nombre d'images → HH:MM:SS:II. Avec `saute` (29,97 et 59,94 images/s,
+    « drop frame »), deux ou quatre numéros d'image sont sautés chaque minute,
+    sauf toutes les dix minutes."""
+    if saute:
+        d = 2 if base == 30 else 4
+        par_dix, par_minute = base * 600 - d * 9, base * 60 - d
+        dix, reste = divmod(images, par_dix)
+        images += d * 9 * dix
+        if reste >= d:
+            images += d * ((reste - d) // par_minute)
+    ii = images % base
+    ss = (images // base) % 60
+    mm = (images // (base * 60)) % 60
+    hh = images // (base * 3600)
+    return f"{hh:02d}:{mm:02d}:{ss:02d}{';' if saute else ':'}{ii:02d}"
+
+
+def _images_depuis_code(code: str, base: int) -> int:
+    """HH:MM:SS:II (ou ;II) → nombre d'images, pour le décalage d'origine."""
+    saute = ";" in code
+    try:
+        hh, mm, ss, ii = (int(x) for x in re.split(r"[:;]", code.strip()))
+    except ValueError:
+        return 0
+    images = ((hh * 60 + mm) * 60 + ss) * base + ii
+    if saute:
+        d = 2 if base == 30 else 4
+        minutes = hh * 60 + mm
+        images -= d * (minutes - minutes // 10)
+    return images
+
+
+def code_d_origine(source: str) -> str:
+    """Le code temporel inscrit dans le fichier par la caméra, s'il y en a un."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format_tags=timecode:stream_tags=timecode", "-of", "json", source],
+            capture_output=True, text=True, timeout=30)
+        d = json.loads(r.stdout or "{}")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return ""
+    code = (d.get("format", {}).get("tags", {}) or {}).get("timecode", "")
+    for st in d.get("streams", []):
+        code = code or (st.get("tags", {}) or {}).get("timecode", "")
+    return code if re.fullmatch(r"\d\d:\d\d:\d\d[:;]\d\d", code or "") else ""
+
+
+def journal_edl(sortie: Path, projet: dict, coupes: list, fmt: str) -> str:
+    """Liste de montage CMX 3600, pour refaire le montage dans un logiciel.
+    Elle ne décrit que des coupes franches : les fondus sont en commentaire."""
+    ips = ((projet.get("video") or {}).get("ips") or 0.0) if projet["type"] == "video" else 0.0
+    if not 1.0 <= ips <= 120.0:
+        ips = 25.0              # son seul, ou cadence illisible
+    base = int(round(ips))
+    code = code_d_origine(projet["source"]) if projet["type"] == "video" else ""
+    saute = ";" in code and base in (30, 60)
+    origine = _images_depuis_code(code, base) if code else 0
+    canaux = (projet.get("audio") or {}).get("canaux", 2)
+    if fmt == "mp4":
+        piste = "AA/V" if canaux >= 2 else "B"
+    else:
+        piste = "AA" if canaux >= 2 else "A"
+
+    titre = re.sub(r"[^A-Za-z0-9 _.-]+", "_", sortie.stem)[:60]
+    # Rien d'autre que ces deux lignes avant le premier plan : des lecteurs de
+    # listes de montage refusent un commentaire placé là (vu avec OpenTimelineIO).
+    L = [f"TITLE: {titre}",
+         "FCM: " + ("DROP FRAME" if saute else "NON-DROP FRAME"),
+         ""]
+    notes = [f"* MONTAGE AU STABILO - {time.strftime('%Y-%m-%d %H:%M')}",
+             f"* CADENCE : {ips:g} IMAGES/S, CODES COMPTES EN BASE {base}"
+             + ("" if projet["type"] == "video" else " (SON SEUL : CADENCE DE CONVENTION)"),
+             "* ORIGINE : " + (f"CODE TEMPOREL DU FICHIER {code}" if code
+                              else "LE FICHIER COMMENCE A 00:00:00:00"),
+             "* LE MONTAGE COMMENCE A 01:00:00:00",
+             "* COUPES FRANCHES SEULEMENT : LES FONDUS SONT INDIQUES EN COMMENTAIRE"]
+    largeur = max(3, len(str(len(coupes))))
+    position = base * 3600          # 01:00:00:00, toujours sans saut à cet instant
+    if saute:
+        position = _images_depuis_code("01:00:00;00", base)
+    for k, c in enumerate(coupes):
+        debut = int(round(c["d"] * ips))
+        fin = max(debut + 1, int(round(c["f"] * ips)))
+        n = fin - debut
+        L.append(f"{k + 1:0{largeur}d}  {'AX':<8} {piste:<5} C        "
+                 f"{_code_temporel(origine + debut, base, saute)} "
+                 f"{_code_temporel(origine + fin, base, saute)} "
+                 f"{_code_temporel(position, base, saute)} "
+                 f"{_code_temporel(position + n, base, saute)}")
+        L.append(f"* FROM CLIP NAME: {projet['nom']}")
+        L.append(f"* SOURCE FILE: {projet['source']}")
+        L.append(f"* FONDU SON : ENTREE {c['fi']:.3f} S, SORTIE {c['fo']:.3f} S")
+        if fmt == "mp4":
+            L.append("* IMAGE : ENTREE " + ("EN FONDU" if c.get("vi", True) else "FRANCHE")
+                     + ", SORTIE " + ("EN FONDU AU NOIR" if c.get("vo", True) else "FRANCHE"))
+        L.append("")
+        position += n
+    return "\n".join(L + notes) + "\n"
+
+
+def ecrire_journaux(sortie: Path, projet: dict, jetons: list, coupes: list,
+                    mode: str, fondu: float, fondu_image: bool, fmt: str) -> list:
+    """Écrit montage.txt et montage.edl à côté du montage."""
+    image = fondu_image and fondu > 0
+    coupes_edl = coupes if image else [dict(c, vi=False, vo=False) for c in coupes]
+    ecrits = []
+    for ext, contenu in (
+            ("txt", journal_texte(sortie, projet, jetons, coupes, mode, fondu,
+                                  fondu_image, fmt)),
+            ("edl", journal_edl(sortie, projet, coupes_edl, fmt))):
+        chemin = sortie.with_suffix("." + ext)
+        with open(chemin, "w", encoding="utf-8") as f:
+            f.write(contenu)
+        ecrits.append(str(chemin))
+    return ecrits
 
 
 def _ffmpeg_suivi(cmd: list, tache: dict, journal: str, sur_temps=None):
@@ -622,6 +1338,39 @@ def produire_audio(tache: dict, source: str, coupes: list, audio: dict,
             partiel.unlink()
 
 
+def finaliser_le_son(tache: dict, sortie: Path):
+    """Dernière étape, facultative : le son du montage passe par finaliser.py
+    (fond, volume à la norme). Le montage garde son nom et sa durée."""
+    script = SCRIPT_DIR / "finaliser.py"
+    if not script.exists():
+        raise RuntimeError("finaliser.py est absent")
+    tache.update(message="Finition du son", progression=0.0)
+    proc = subprocess.Popen([PYTHON_BIN, str(script), str(sortie), "--sur-place"],
+                            cwd=str(SCRIPT_DIR), text=True, errors="replace",
+                            env=dict(os.environ, PYTHONUNBUFFERED="1"),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    tache["proc"] = proc
+    dernieres = deque(maxlen=6)
+    for ligne in proc.stdout:
+        ligne = ligne.strip()
+        if ligne:
+            dernieres.append(ligne)
+        m = re.match(r"\[(\d)/9\]", ligne)
+        if m:
+            tache["progression"] = (int(m.group(1)) - 1) / 9.0
+    proc.wait()
+    tache["proc"] = None
+    if proc.returncode != 0:
+        # Arrêté net, finaliser.py n'a pas pu ranger son dossier de travail
+        for reste in sortie.parent.glob(".finition_*"):
+            if any(f.name.startswith(sortie.stem) for f in reste.iterdir()):
+                shutil.rmtree(reste, ignore_errors=True)
+    if tache.get("annulee"):
+        raise Annule()
+    if proc.returncode != 0:
+        raise RuntimeError("\n".join(dernieres) or "finaliser.py a échoué")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SERVEUR
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -629,7 +1378,8 @@ def produire_audio(tache: dict, source: str, coupes: list, audio: dict,
 TRANSCRIPTIONS = {}     # id projet → {proc, lignes, debut}
 APERCUS = {}            # id projet → "encours" | "erreur"
 TACHES = {}             # id tâche → dict
-JETONS = {}             # id projet → (mtime, jetons, langue)
+JETONS = {}             # id projet → (mtime, jetons, langue, origine, estimé)
+EXISTANTS = {}          # id projet → texte déjà produit trouvé pour ce fichier
 VERROU = threading.Lock()
 
 
@@ -646,9 +1396,44 @@ def charger_jetons(dossier: Path, pid: str):
     data = lire_json(chemin)
     if not data:
         return None, None
+    if data.get("version", 1) < VERSION_JETONS:
+        # Transcription d'avant les repères de début et de fin : on les pose sans
+        # retranscrire, et le surlignage enregistré suit le décalage des numéros.
+        projet = lire_json(dossier / "projet.json", {}) or {}
+        data["jetons"], decalage = poser_les_bords(data["jetons"],
+                                                   projet.get("duree") or 0.0)
+        data["version"] = VERSION_JETONS
+        sel = lire_json(dossier / "selection.json")
+        if decalage and sel and sel.get("plages"):
+            sel["plages"] = [[p[0] + decalage, p[1] + decalage] for p in sel["plages"]]
+            ecrire_json(dossier / "selection.json", sel)
+        ecrire_json(chemin, data)
+        mtime = chemin.stat().st_mtime
     with VERROU:
-        JETONS[pid] = (mtime, data["jetons"], data.get("langue", ""))
+        JETONS[pid] = (mtime, data["jetons"], data.get("langue", ""),
+                       data.get("origine", ""), bool(data.get("estime")))
     return data["jetons"], data.get("langue", "")
+
+
+def origine_du_texte(pid: str) -> tuple:
+    """(origine, estimé) du texte chargé : origine vide pour une transcription,
+    sinon « doublage », « sous-titres » ou « origine »."""
+    with VERROU:
+        cache = JETONS.get(pid)
+    return (cache[3], cache[4]) if cache else ("", False)
+
+
+def texte_existant(projet: dict):
+    """Ce que traduire.py ou doubler.py ont laissé pour ce fichier (cherché une
+    fois par projet)."""
+    pid = projet["id"]
+    with VERROU:
+        if pid in EXISTANTS:
+            return EXISTANTS[pid]
+    trouve = chercher_texte_existant(projet["source"], projet.get("duree") or 0.0)
+    with VERROU:
+        EXISTANTS[pid] = trouve
+    return trouve
 
 
 def chemin_apercu(dossier: Path, projet: dict) -> Path:
@@ -732,10 +1517,14 @@ def etat_du_projet(dossier: Path, projet: dict) -> dict:
     pid = projet["id"]
     e = {k: projet.get(k) for k in ("id", "nom", "source", "type", "duree", "video")}
     e["source_presente"] = os.path.isfile(projet["source"])
+    existant = texte_existant(projet)
+    e["existant"] = existant["genre"] if existant else ""
+    e["reprise"] = (projet.get("reprise") or {}).get("genre", "")
     t = TRANSCRIPTIONS.get(pid)
     if (dossier / "transcription.json").exists() and not (t and t["proc"].poll() is None):
         e["etat"] = "pret"
         _, e["langue"] = charger_jetons(dossier, pid)
+        e["origine"] = origine_du_texte(pid)[0]
     elif t and t["proc"].poll() is None:
         e["etat"] = "transcription"
         e["depuis"] = round(time.time() - t["debut"])
@@ -852,6 +1641,13 @@ def creer_blueprint():
             dossier = MONTAGE_DIR / f"{_slug(Path(chemin).stem)}-{pid}"
             dossier.mkdir(parents=True, exist_ok=True)
         projet = dict(info, id=pid, source=chemin, nom=Path(chemin).name)
+        # Un fichier déjà sous-titré ou doublé a son texte : il est repris, sauf
+        # si on a demandé une fois de transcrire le son de ce fichier.
+        ancien = lire_json(dossier / "projet.json", {}) or {}
+        if "reprise" in ancien:
+            projet["reprise"] = ancien["reprise"]
+        elif not (dossier / "transcription.json").exists():
+            projet["reprise"] = texte_existant(projet)
         ecrire_json(dossier / "projet.json", projet)
         lancer_apercu(dossier, projet)
         if not (dossier / "transcription.json").exists():
@@ -872,10 +1668,35 @@ def creer_blueprint():
             return jsonify({"erreur": "La transcription est déjà en cours."}), 409
         if not os.path.isfile(projet["source"]):
             return jsonify({"erreur": "Le fichier d'origine est introuvable."}), 400
-        for nom in ("transcription.json", "selection.json"):
-            if (dossier / nom).exists():
-                (dossier / nom).unlink()
-        lancer_transcription(dossier, projet, (data.get("langue") or "").strip().lower())
+        # « existant » : le texte déjà traduit ; sinon le son est transcrit
+        if data.get("texte") == "existant":
+            with VERROU:
+                EXISTANTS.pop(pid, None)
+            projet["reprise"] = texte_existant(projet)
+            if not projet["reprise"]:
+                return jsonify({"erreur": "Aucun texte déjà produit n'a été trouvé "
+                                          "pour ce fichier."}), 400
+        else:
+            projet["reprise"] = None
+        langue = (data.get("langue") or "").strip().lower()
+        existant = texte_existant(projet)
+        if not langue and existant and existant["genre"] == "doublage":
+            langue = existant["langue"]         # la langue de la voix doublée
+        ecrire_json(dossier / "projet.json", projet)
+        # Le texte change, pas ce qu'on a surligné : le surlignage est gardé
+        # en secondes et retrouvera ses mots dans le nouveau texte.
+        jetons, _ = charger_jetons(dossier, pid)
+        sel = lire_json(dossier / "selection.json", {}) or {}
+        propres = plages_propres(sel.get("plages") or [], len(jetons)) if jetons else []
+        if propres:
+            sel["temps"] = [[jetons[i][1], jetons[j][2]] for i, j in propres]
+            sel.pop("plages", None)
+            ecrire_json(dossier / "selection.json", sel)
+        elif (dossier / "selection.json").exists() and not sel.get("temps"):
+            (dossier / "selection.json").unlink()
+        if (dossier / "transcription.json").exists():
+            (dossier / "transcription.json").unlink()
+        lancer_transcription(dossier, projet, langue)
         return jsonify(etat_du_projet(dossier, projet))
 
     @app.route("/api/transcription/<pid>")
@@ -885,7 +1706,12 @@ def creer_blueprint():
         if jetons is None:
             abort(404)
         sel = lire_json(dossier / "selection.json", {}) or {}
+        if sel.get("temps") and "plages" not in sel:
+            sel["plages"] = plages_depuis_temps(jetons, sel.pop("temps"))
+            ecrire_json(dossier / "selection.json", sel)
+        origine, estime = origine_du_texte(pid)
         return jsonify({"jetons": jetons, "langue": langue,
+                        "origine": origine, "estime": estime,
                         "plages": sel.get("plages", []),
                         "mode": sel.get("mode", "garder"),
                         "fondu": sel.get("fondu", FONDU_DEFAUT)})
@@ -911,7 +1737,8 @@ def creer_blueprint():
         else:
             coupes = calculer_coupes(dossier, jetons, plages, fondu,
                                      projet.get("duree") or 0.0,
-                                     inverse=(mode == "couper"))
+                                     inverse=(mode == "couper"),
+                                     estime=origine_du_texte(pid)[1])
         ecrire_json(dossier / "selection.json",
                     {"plages": plages, "fondu": fondu, "mode": mode})
         return data, fondu, coupes
@@ -953,10 +1780,15 @@ def creer_blueprint():
                 return jsonify({"erreur": "Un montage est déjà en cours de production."}), 409
 
         sortie = chemin_de_sortie(projet["source"], fmt)
+        jetons, _ = charger_jetons(dossier, pid)
+        fondu_image = bool(data.get("fondu_image", True))
+        finition = bool(data.get("finaliser"))
         tid = uuid.uuid4().hex[:12]
+        # finition : « » (pas demandée), « faite », ou « echec » (le montage
+        # est alors laissé tel qu'il a été monté)
         tache = {"id": tid, "projet": pid, "etat": "encours", "progression": 0.0,
                  "message": "Préparation", "sortie": str(sortie), "proc": None,
-                 "annulee": False, "format": fmt,
+                 "annulee": False, "format": fmt, "journaux": [], "finition": "",
                  "duree": round(sum(c["f"] - c["d"] for c in coupes), 2)}
         TACHES[tid] = tache
 
@@ -964,10 +1796,26 @@ def creer_blueprint():
             try:
                 if fmt == "mp4":
                     produire_video(tache, projet["source"], coupes, fondu,
-                                   bool(data.get("fondu_image", True)), sortie)
+                                   fondu_image, sortie)
                 else:
                     produire_audio(tache, projet["source"], coupes,
                                    projet["audio"], fmt, sortie)
+                try:
+                    tache["journaux"] = ecrire_journaux(
+                        sortie, projet, jetons, coupes, data["mode"], fondu,
+                        fondu_image, fmt)
+                except Exception as ex:     # le montage est fait : on le dit quand même
+                    tache["journaux"] = []
+                    print(f"⚠️  Journal des coupes non écrit : {ex}")
+                if finition:
+                    try:
+                        finaliser_le_son(tache, sortie)
+                        tache["finition"] = "faite"
+                    except Annule:
+                        raise
+                    except Exception as ex:
+                        tache["finition"] = "echec"
+                        print(f"⚠️  Son non finalisé : {ex}")
                 tache.update(etat="fini", progression=1.0, message="Montage terminé")
             except Annule:
                 tache.update(etat="annule", message="Production arrêtée")
@@ -979,7 +1827,7 @@ def creer_blueprint():
 
     def vue_tache(t):
         v = {k: t[k] for k in ("id", "etat", "progression", "message", "sortie",
-                               "format", "duree")}
+                               "format", "duree", "journaux", "finition")}
         if t["etat"] == "fini" and os.path.exists(t["sortie"]):
             v["taille"] = os.path.getsize(t["sortie"])
         return v
@@ -1103,7 +1951,7 @@ input:focus,select:focus{border-color:var(--accent)}
 #bilan{flex:none;padding:14px 16px 10px;border-bottom:1px solid var(--border)}
 #bilan .g{font-size:20px;font-weight:700}
 #bilan .p{color:var(--muted);font-size:12px}
-#bilan .ligne{margin:10px 0 0}
+#bilan .ligne{margin:10px 0 0;flex-wrap:wrap}
 #passages{flex:1;overflow-y:auto;padding:8px}
 .passage{display:flex;gap:10px;align-items:baseline;padding:8px 10px;border-radius:9px;cursor:pointer}
 .passage:hover{background:#181b22}
@@ -1124,6 +1972,9 @@ input:focus,select:focus{border-color:var(--accent)}
 #suivi-texte span{flex:1}
 #fini{font-size:13px;line-height:1.5}
 #fini .chemin{font:11.5px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);word-break:break-all;margin:4px 0 10px}
+#fini #fini-journaux,#fini #fini-finition{font:12px/1.4 inherit;font-family:inherit;word-break:normal;margin-top:-4px}
+#fini #fini-journaux:empty,#fini #fini-finition:empty{display:none}
+#fini #fini-finition.echec{color:#ff9d9d}
 #fini .ligne{margin:0}
 #fini .ok{color:var(--ok);font-weight:700}
 #echec{color:#ff9d9d;font-size:12.5px;margin-top:8px;white-space:pre-wrap;word-break:break-word}
@@ -1155,6 +2006,10 @@ input:focus,select:focus{border-color:var(--accent)}
 .couper .outils button#o-stabilo.actif,.outils button#m-couper.actif{background:var(--raye);color:#4a1712}
 #modes{align-items:center}
 #modes span{padding:0 4px 0 12px;font-size:12px;color:var(--muted);white-space:nowrap}
+#origine{max-width:calc(72ch + 96px);margin:0 auto;padding:22px 28px 0 88px;font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--encre2)}
+#origine + #texte{padding-top:18px}
+#origine button{font:inherit;border:none;background:none;padding:0;margin-left:6px;color:#b8530f;text-decoration:underline;cursor:pointer}
+#origine button:hover{color:#8a3d08}
 #patience{max-width:560px;margin:16vh auto 0;padding:0 28px;text-align:center;font:17px/1.6 "Iowan Old Style","Palatino Linotype",Georgia,serif;color:var(--encre)}
 #patience .rond{width:34px;height:34px;border-radius:50%;border:3px solid var(--filet);border-top-color:#e0621a;margin:0 auto 22px;animation:tour 1s linear infinite}
 #patience.erreur .rond{display:none}
@@ -1181,6 +2036,7 @@ input:focus,select:focus{border-color:var(--accent)}
   #ecran video{max-height:30vh}
   #passages{overflow:visible}
   #texte{font-size:17px;padding:22px 16px 40vh 8px}
+  #origine{padding:16px 16px 0 8px}
 }
 </style>
 </head>
@@ -1229,6 +2085,7 @@ input:focus,select:focus{border-color:var(--accent)}
         <div class="ligne">
           <button class="btn" id="b-ecouter" disabled>▶ Voir le montage</button>
           <button class="btn" id="b-effacer" disabled>Tout effacer</button>
+          <button class="btn" id="b-silences" hidden>Rayer les silences</button>
         </div>
       </div>
       <div id="passages"></div>
@@ -1248,6 +2105,7 @@ input:focus,select:focus{border-color:var(--accent)}
               </select>
             </label>
             <label class="case" id="l-image"><input type="checkbox" id="fondu-image" checked> Fondu au noir de l'image</label>
+            <label class="case" title="Dernière étape : le bruit de fond est retiré s'il y en a un, et le volume est mis à la norme de diffusion"><input type="checkbox" id="finaliser"> Finaliser le son (bruit de fond, volume)</label>
           </div>
           <button class="btn fort" id="b-produire" disabled>Produire le montage</button>
         </div>
@@ -1258,6 +2116,8 @@ input:focus,select:focus{border-color:var(--accent)}
         <div id="fini" hidden>
           <div><span class="ok">Montage terminé</span> · <span id="fini-detail"></span></div>
           <div class="chemin"></div>
+          <div class="chemin" id="fini-journaux"></div>
+          <div class="chemin" id="fini-finition"></div>
           <div class="ligne">
             <a class="btn fort" id="b-lire" target="_blank" style="text-decoration:none">Regarder</a>
             <button class="btn" id="b-dossier">Ouvrir le dossier</button>
@@ -1277,6 +2137,7 @@ input:focus,select:focus{border-color:var(--accent)}
           <button class="btn" id="b-reessayer">Recommencer la transcription</button>
         </div>
       </div>
+      <div id="origine" hidden><span></span><button id="b-texte"></button></div>
       <div id="texte"></div>
     </div>
   </div>
@@ -1301,6 +2162,7 @@ const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','
 let CONFIG = null;
 let P = null;            // projet ouvert
 let J = [];              // jetons [texte, début, fin, phrase]
+let origineTexte = '';   // '' : transcription ; sinon doublage, sous-titres, origine
 let sel = new Uint8Array(0);
 let spans = [];
 let histo = [], futur = [];
@@ -1317,6 +2179,9 @@ function hms(t){
   t = Math.max(0, Math.floor(t));
   const h = Math.floor(t/3600), m = Math.floor(t%3600/60), s = t%60;
   return (h ? h + ':' + String(m).padStart(2,'0') : m) + ':' + String(s).padStart(2,'0');
+}
+function court(t){      // durée d'un passage sans paroles : les dixièmes comptent quand c'est bref
+  return t < 10 ? t.toFixed(1).replace('.', ',') + ' s' : enClair(t);
 }
 function enClair(t){
   t = Math.round(t);
@@ -1426,7 +2291,7 @@ function installer(p){
   document.title = p.nom + ' — Montage au stabilo';
   $('#titre .n').textContent = p.nom;
   $('#titre .d').textContent = (p.type === 'video' ? 'Vidéo' : 'Enregistrement') + ' · ' + enClair(p.duree);
-  $('#texte').innerHTML = '';
+  $('#texte').innerHTML = ''; $('#origine').hidden = true;
   $('#ecran').innerHTML = ''; $('#ecran').className = p.type === 'video' ? '' : 'son';
   $('#format').innerHTML = (p.type === 'video' ? '<option value="mp4">Une vidéo (MP4)</option>' : '')
     + '<option value="mp3">Un son (MP3)</option><option value="m4a">Un son (M4A)</option><option value="wav">Un son (WAV)</option>';
@@ -1444,6 +2309,11 @@ function reglerFormat(){
     (P && P.type === 'video' ? '▶ Voir le montage' : '▶ Écouter le montage'));
 }
 $('#format').onchange = reglerFormat;
+// La case « Finaliser le son » reste comme on l'a laissée
+try { $('#finaliser').checked = localStorage.getItem('montage-finaliser') === '1'; } catch(e) {}
+$('#finaliser').onchange = e => {
+  try { localStorage.setItem('montage-finaliser', e.target.checked ? '1' : '0'); } catch(err) {}
+};
 
 function poserLecteur(){
   if (lecteur || !P) return;
@@ -1467,8 +2337,9 @@ async function suivreProjet(p){
     if (p.apercu === 'pret' || p.apercu === 'erreur') return;
   } else if (p.etat === 'transcription' || p.etat === 'attente') {
     pat.hidden = false; pat.className = ''; $('#reprise').hidden = true;
-    pat.querySelector('.quoi').textContent = 'Transcription en cours' +
-      (p.depuis ? ' depuis ' + enClair(p.depuis) : '') + '…';
+    pat.querySelector('.quoi').textContent = (p.reprise
+      ? 'Reprise du texte ' + (NOMS_TEXTE[p.reprise] || 'déjà fait')
+      : 'Transcription en cours' + (p.depuis ? ' depuis ' + enClair(p.depuis) : '')) + '…';
     pat.querySelector('.fil').textContent = (p.journal || []).join('\n').replace(/^\s+/, '');
   } else {
     pat.hidden = false; pat.className = 'erreur'; $('#reprise').hidden = false;
@@ -1480,6 +2351,42 @@ async function suivreProjet(p){
     try { suivreProjet(await api('/api/projet/' + p.id)); } catch(e) {}
   }, 1500);
 }
+/* Un fichier déjà sous-titré ou doublé : son texte est repris, et l'on peut
+   toujours passer de ce texte à la transcription du son, ou l'inverse. */
+const NOMS_TEXTE = {doublage: 'du doublage', 'sous-titres': 'des sous-titres', origine: 'déjà transcrit'};
+function afficherOrigine(origine){
+  const o = $('#origine'), b = $('#b-texte');
+  let texte = '', bouton = '', vers = 'son';
+  if (origine === 'doublage') {
+    texte = "Texte du doublage, repris sans nouvelle transcription. Chaque phrase est à sa place ; à l'intérieur d'une phrase, la place des mots est estimée.";
+    bouton = 'Transcrire le son à la place';
+  } else if (origine === 'sous-titres') {
+    texte = "Texte des sous-titres, repris sans nouvelle transcription. La voix parle une autre langue : chaque sous-titre est à sa place, la place des mots à l'intérieur est estimée.";
+    bouton = 'Transcrire le son à la place';
+  } else if (origine === 'origine') {
+    texte = 'Texte repris de la traduction de cette vidéo, sans nouvelle transcription.';
+    bouton = 'Transcrire à nouveau';
+  } else if (P.existant === 'doublage' || P.existant === 'sous-titres') {
+    texte = "Texte transcrit d'après le son.";
+    bouton = 'Afficher le texte ' + NOMS_TEXTE[P.existant];
+    vers = 'existant';
+  }
+  o.hidden = !texte;
+  o.querySelector('span').textContent = texte;
+  b.textContent = bouton; b.dataset.vers = vers;
+}
+$('#b-texte').onclick = async e => {
+  if (tache) return;
+  try {
+    const p = await api('/api/retranscrire/' + P.id, {texte: e.target.dataset.vers});
+    finMontage(); clearTimeout(veille);
+    P = Object.assign(P, p);
+    J = []; sel = new Uint8Array(0); spans = []; histo = []; futur = []; coupes = [];
+    $('#texte').innerHTML = ''; $('#origine').hidden = true;
+    bilan(); boutons();
+    suivreProjet(p);
+  } catch(err) { $('#origine span').textContent = err.message; }
+};
 $('#b-reessayer').onclick = async () => {
   try { suivreProjet(await api('/api/retranscrire/' + P.id, {langue: $('#langue2').value})); }
   catch(e) { $('#patience .fil').textContent = e.message; }
@@ -1496,6 +2403,8 @@ $('#b-autre').onclick = () => {
 async function chargerTexte(){
   const d = await api('/api/transcription/' + P.id);
   J = d.jetons;
+  origineTexte = d.origine;
+  afficherOrigine(d.origine);
   sel = new Uint8Array(J.length);
   for (const [a, b] of d.plages)
     for (let i = Math.max(0, a); i <= Math.min(J.length - 1, b); i++) sel[i] = 1;
@@ -1507,12 +2416,14 @@ async function chargerTexte(){
 
 function rendre(){
   const out = [];
+  const sansMots = {doublage: 'sans doublage', 'sous-titres': 'sans sous-titres'}[origineTexte] || 'sans paroles';
   let ouvert = false, car = 0, precP = null, precF = 0;
   for (let i = 0; i < J.length; i++) {
     const [t, d, f, p] = J[i];
     if (t === null) {
       if (ouvert) { out.push('</p></div>'); ouvert = false; }
-      out.push(`<div class="par"><a class="hor" data-t="${d}">${hms(d)}</a><p><span class="m pause" data-i="${i}">${enClair(f - d)} sans paroles</span></p></div>`);
+      const ou = i === 0 ? 'Début · ' : (i === J.length - 1 ? 'Fin · ' : '');
+      out.push(`<div class="par"><a class="hor" data-t="${d}">${hms(d)}</a><p><span class="m pause" data-i="${i}" title="Cliquer pour marquer ou démarquer">${ou}${court(f - d)} ${sansMots}</span></p></div>`);
       continue;
     }
     if (!ouvert || (p !== precP && (d - precF >= 0.9 || car > 420))) {
@@ -1566,6 +2477,11 @@ function boutons(){
   $('#b-annuler').disabled = !histo.length;
   $('#b-retablir').disabled = !futur.length;
   $('#b-effacer').disabled = !n;
+  // Proposé en mode coupe, tant qu'il reste un passage sans paroles non rayé
+  let libres = 0;
+  for (let i = 0; i < J.length; i++) if (J[i][0] === null && !sel[i]) libres++;
+  $('#b-silences').hidden = mode !== 'couper' || !libres;
+  $('#b-silences').textContent = libres > 1 ? 'Rayer les ' + libres + ' silences' : 'Rayer le silence';
   $('#b-produire').disabled = !n || !coupes.length || (tache !== null);
   $('#b-ecouter').disabled = !n || !coupes.length || !lecteur;
 }
@@ -1582,6 +2498,15 @@ function retablir(){
 $('#b-annuler').onclick = annuler;
 $('#b-retablir').onclick = retablir;
 $('#b-effacer').onclick = () => changer(0, J.length - 1, 0);
+$('#b-silences').onclick = () => {
+  const avant = sel.slice();
+  let change = false;
+  for (let i = 0; i < J.length; i++) if (J[i][0] === null && !sel[i]) { sel[i] = 1; change = true; }
+  if (!change) return;
+  histo.push(avant); if (histo.length > 200) histo.shift();
+  futur = [];
+  peindre(0, J.length - 1); apresChangement();
+};
 
 function choisirOutil(o){
   outil = o;
@@ -1653,13 +2578,14 @@ function finGeste(e, valide){
   apercu(-1, -1);
   if (!valide) return;
   if (g) { changer(a, b, gommeGeste ? 0 : 1); dernier = b; }
+  else if (J[a][0] === null) { dernier = a; changer(a, a, sel[a] ? 0 : 1); }   // un passage sans paroles se marque d'un clic
   else { dernier = a; aller(J[a][1], true); }
 }
 texte.addEventListener('pointerup', e => finGeste(e, true));
 texte.addEventListener('pointercancel', e => finGeste(e, false));
 texte.addEventListener('dblclick', e => {
   const i = jetonSous(e.clientX, e.clientY);
-  if (i < 0) return;
+  if (i < 0 || J[i][0] === null) return;
   let a = i, b = i;
   if (J[i][0] !== null) {
     while (a > 0 && J[a-1][3] === J[i][3]) a--;
@@ -1768,7 +2694,7 @@ function bilan(duree){
     $('#passages').innerHTML = '<div id="vide">' + (couper
       ? 'Glissez sur le texte pour rayer ce que vous retirez : le montage garde tout le reste.'
       : 'Glissez sur le texte pour surligner ce que vous gardez.')
-      + '<br>Un clic sur un mot lance la lecture à cet endroit. Un double clic prend la phrase entière. Pour un long passage, cliquez sur son premier mot puis, majuscule enfoncée, sur son dernier.</div>';
+      + '<br>Un clic sur un mot lance la lecture à cet endroit. Un clic sur un passage sans paroles le marque. Un double clic prend la phrase entière. Pour un long passage, cliquez sur son premier mot puis, majuscule enfoncée, sur son dernier.</div>';
     return;
   }
   if (duree === undefined) return;
@@ -1801,7 +2727,8 @@ $('#b-produire').onclick = async () => {
   try {
     const d = await api('/api/produire/' + P.id, {
       plages: plages(), mode, fondu: parseFloat($('#fondu').value),
-      format: $('#format').value, fondu_image: $('#fondu-image').checked});
+      format: $('#format').value, fondu_image: $('#fondu-image').checked,
+      finaliser: $('#finaliser').checked});
     tache = d.id;
     $('#reglages').hidden = true; $('#fini').hidden = true; $('#suivi').hidden = false;
     $('#jauge i').style.width = '0';
@@ -1824,6 +2751,13 @@ async function suivreTache(){
     $('#fini').hidden = false;
     $('#fini-detail').textContent = enClair(t.duree) + (t.taille ? ' · ' + poids(t.taille) : '');
     $('#fini .chemin').textContent = t.sortie;
+    const noms = (t.journaux || []).map(c => c.split('/').pop().split('.').pop());
+    $('#fini-journaux').textContent = noms.length
+      ? 'Dans le même dossier, sous le même nom : le journal des coupes (.' + noms.join(') et la liste de montage (.') + ')'
+      : '';
+    $('#fini-finition').className = 'chemin' + (t.finition === 'echec' ? ' echec' : '');
+    $('#fini-finition').textContent = t.finition === 'faite' ? 'Son finalisé : fond vérifié, volume à la norme.'
+      : t.finition === 'echec' ? "Le son n'a pas pu être finalisé : le montage est resté tel qu'il a été monté." : '';
     $('#b-lire').href = BASE + '/resultat/' + t.id;
     $('#b-lire').textContent = t.format === 'mp4' ? 'Regarder' : 'Écouter';
     $('#b-dossier').dataset.t = t.id;

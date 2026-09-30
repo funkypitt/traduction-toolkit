@@ -27,6 +27,7 @@ L'installeur est **interactif** : il met en place ffmpeg, Miniconda, l'environne
 | `clipper.py` | Extraction de clips viraux avec sous-titres karaoké | `clip.mp4` + `clip.txt` |
 | `monter.py` | Montage au stabilo : on surligne le texte à garder (ou à couper), le montage suit | `video_montage.mp4` ou `.mp3` |
 | `nettoyer.py` | Restauration audio à toucher léger (débruitage, normalisation) | `fichier_nettoye.mp3` |
+| `finaliser.py` | Finition prête à diffuser (podcast), son ou vidéo | `fichier_podcast.mp3` ou `.mp4` |
 | `gui.py` | Panneau de contrôle web : tous les outils, montage compris | — |
 | `doctor.py` | Diagnostic et installation des dépendances | — |
 
@@ -337,10 +338,45 @@ Le fichier est transcrit (WhisperX, horodatage mot par mot), le texte s'affiche 
 - **glisser** sur le texte surligne ; l'outil **Gomme** (ou Alt + glisser) efface ;
 - **clic** sur un mot : la lecture reprend à cet endroit ; **double clic** : la phrase entière ;
 - **clic** sur le premier mot puis **Maj + clic** sur le dernier : un long passage ;
-- les passages sans paroles (silence, musique) apparaissent dans le texte et se surlignent comme un mot ;
+- les passages sans paroles (silence, musique) apparaissent dans le texte, avec toujours un repère pour le **début** et la **fin** du fichier, là où traînent les bruits de micro ; un **clic** les marque, et en mode coupe le bouton **Rayer les silences** les marque tous ;
 - **Voir le montage** joue les passages à la suite, avant de produire quoi que ce soit.
 
 Le montage est produit dans `output/` : vidéo MP4 ou son MP3/M4A/WAV. À l'image, une coupe qui retire une seconde ou plus se fait par un fondu au noir ; une coupe plus courte (un mot, une hésitation) est franche, pour que l'écran ne clignote pas. Le son a toujours son fondu. Chaque coupe est placée dans le creux le plus calme autour du passage, jamais au ras d'un mot. Le surlignage est enregistré au fur et à mesure : on retrouve son travail en rouvrant le fichier.
+
+**Vidéo déjà sous-titrée ou doublée.** Quand on ouvre une vidéo sortie de `traduire.py` (`video_fr.mp4`) ou de `doubler.py` (`video_dubbed_fr.mp4`), rien n'est retranscrit : le texte traduit est repris de `work-files/` et de `output/` (les sous-titres `.srt`, ou le texte dit par la voix doublée), et s'affiche en une seconde. Pour un doublage, chaque clip de voix est retrouvé dans le son de la vidéo, là où le mixage l'a réellement posé. La place de chaque phrase est donc mesurée ; à l'intérieur d'une phrase, la place des mots est estimée (écart médian d'un dixième de seconde sur un doublage), et la coupe se cale sur le creux le plus calme autour. La vidéo de départ, elle, retrouve sa transcription mot par mot. Au-dessus du texte, un lien permet de **transcrire le son à la place**, ou de revenir au texte traduit : ce qui était surligné le reste. Le rapprochement se fait par le nom du fichier, qui ne doit donc pas avoir été changé.
+
+La case **Finaliser le son** passe le montage produit par `finaliser.py` (voir plus bas), sans changer son nom ni sa durée.
+
+Chaque montage est accompagné de deux fichiers du même nom : un **journal des coupes** (`.txt` : pour chaque morceau gardé, ses instants dans l'origine et dans le montage, ses fondus, son texte, et entre deux morceaux ce qui est retiré) et une **liste de montage** (`.edl`, format CMX 3600) pour refaire le montage dans un logiciel. La liste ne décrit que des coupes franches ; les fondus y figurent en commentaire.
+
+### Finition prête à diffuser (finaliser.py)
+
+```bash
+python finaliser.py entretien.wav                  # → entretien_podcast.mp3, mono
+python finaliser.py entretien.mp4                  # → entretien_podcast.mp4
+python finaliser.py entretien.wav --canaux stereo  # garder la stéréo
+python finaliser.py entretien.wav --analyse-seule  # le diagnostic, sans rien écrire
+python finaliser.py dossier/ -o prets/             # tout un dossier
+python finaliser.py video_fr.mp4 --sur-place       # le fichier garde son nom et sa durée
+```
+
+**En fin de chaîne.** Les scripts qui produisent une vidéo (`traduire.py`, `traduire-pro.py`, `sous_titrer_docx.py`, `doubler.py`, `clipper.py`) acceptent `--finaliser` : leur dernière étape passe alors la vidéo par `finaliser.py --sur-place`. La vidéo garde son nom et sa durée (rien n'est rogné, pour que les sous-titres restent calés), le rapport est écrit à côté en `_finition.json`, et si la finition échoue la vidéo est laissée telle quelle. La même case existe dans le panneau (`gui.py`), dans la page de montage et dans l'extension du navigateur. Comme `finaliser.py` seul, elle produit un son **mono**.
+
+Tout en un, et d'abord ne pas nuire : chaque correction n'est appliquée que si l'analyse la justifie, et le rapport (`_podcast.json`) dit ce qui a été fait, ce qui a été laissé, et pourquoi.
+
+| Étape | Ce qui est fait | Quand |
+|---|---|---|
+| Canaux | sortie mono ; canal vide écarté, phase inversée retournée, canaux décalés recalés, niveaux inégaux rééquilibrés | toujours examiné, corrigé si besoin |
+| Conditionnement | passe-haut 60 Hz ; filtres étroits sur la ronflette secteur | ronflette : seulement si détectée |
+| Rognage | silences de début et de fin coupés, en gardant 0,4 s avant le premier son et 1 s après le dernier | si plus de 0,3 s à retirer |
+| Débruitage | DeepFilterNet3 à faible dose (8 dB, 12 si le fond est fort), jugé par DNSMOS ; repli sur une soustraction douce, puis sur rien | seulement si un bruit régulier est à moins de 40 dB sous la parole ; jamais sur un fond musical |
+| Nivelage | lent et doux | seulement si l'étendue dynamique dépasse 14 LU |
+| Volume | −19 LUFS en mono, −16 en stéréo, par gain constant ; le limiteur ne retire jamais plus de 4 dB, et aux seules crêtes | toujours |
+| Fondus | entrée 0,25 s, sortie 0,6 s, jamais sur un mot | toujours |
+| Encodage | MP3 à débit constant (128 kbit/s mono, 192 stéréo), M4A, WAV, ou MP4 ; titre, auteur, pochette et chapitres conservés | — |
+| Contrôle | sonie, crête vraie et durée mesurées sur le fichier publié ; ce que l'encodeur a changé est compensé | toujours |
+
+Pour une vidéo, l'image est recopiée telle quelle quand rien n'est rogné ; sinon elle est réencodée (H.264, qualité 18) avec ses fondus.
 
 ## Langues supportées
 

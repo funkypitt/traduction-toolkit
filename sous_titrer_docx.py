@@ -1018,6 +1018,22 @@ def _scale_style_for_video(style_str: str, video_width: int, video_height: int) 
     return re.sub(r"(FontSize|MarginV)=(\d+)", scale_field, style_str)
 
 
+def finaliser_le_son(video: str):
+    """Option --finaliser : le son de la vidéo produite passe par finaliser.py
+    (fond, volume à la norme). La vidéo garde son nom et sa durée ; si la
+    finition échoue, elle est laissée telle qu'elle est."""
+    script = Path(os.path.abspath(__file__)).parent / "finaliser.py"
+    if not os.path.exists(video):
+        return
+    if not script.exists():
+        print("   ⚠️  finaliser.py est absent : le son n'est pas finalisé")
+        return
+    print(f"\n🎧 Finition du son : {os.path.basename(video)}", flush=True)
+    r = subprocess.run([sys.executable, str(script), video, "--sur-place"])
+    if r.returncode != 0:
+        print("   ⚠️  La finition du son a échoué : la vidéo est laissée telle quelle")
+
+
 def burn_subtitles(video: str, srt: str, output: str, style: str = "default"):
     import shutil, tempfile
     print(f"\n🎬 Incrustation (style: {style})...")
@@ -1072,6 +1088,9 @@ def main():
     parser.add_argument("--resume", help="Reprendre depuis un JSON de segments alignés")
     parser.add_argument("--whisperx-json", help="JSON WhisperX pré-calculé")
     parser.add_argument("--srt-only", action="store_true", help="Générer le SRT sans graver")
+    parser.add_argument("--finaliser", action="store_true",
+                        help="Finaliser le son de la vidéo produite (finaliser.py : "
+                             "bruit de fond, volume à la norme)")
     parser.add_argument("--llm", choices=["claude", "local"], default="local",
                         help="Backend LLM : local (Ollama, défaut) ou claude (API Anthropic)")
     parser.add_argument("--ollama-model", default=OLLAMA_MODEL,
@@ -1116,6 +1135,8 @@ def main():
     if not args.srt_only:
         output = f"{base}_fr.mp4"
         burn_subtitles(video, srt_path, output, style=args.style)
+        if args.finaliser:
+            finaliser_le_son(output)
     else:
         print(f"\n✅ SRT généré : {srt_path}")
 

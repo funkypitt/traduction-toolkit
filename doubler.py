@@ -5482,6 +5482,22 @@ def _build_watermark_filter(video_path: str) -> str:
     return ":".join(parts)
 
 
+def finaliser_le_son(video: str):
+    """Option --finaliser : le son de la vidéo produite passe par finaliser.py
+    (fond, volume à la norme). La vidéo garde son nom et sa durée ; si la
+    finition échoue, elle est laissée telle qu'elle est."""
+    script = SCRIPT_DIR / "finaliser.py"
+    if not os.path.exists(video):
+        return
+    if not script.exists():
+        print("   ⚠️  finaliser.py est absent : le son n'est pas finalisé")
+        return
+    print(f"\n🎧 Finition du son : {os.path.basename(video)}", flush=True)
+    r = subprocess.run([sys.executable, str(script), video, "--sur-place"])
+    if r.returncode != 0:
+        print("   ⚠️  La finition du son a échoué : la vidéo est laissée telle quelle")
+
+
 def assemble_video(video_path: str, mixed_audio_path: str,
                    output_path: str, watermark: bool = True,
                    skip_seconds: float = 0.0) -> str:
@@ -6145,6 +6161,9 @@ def main():
     p.add_argument("--fix-pitch", action="store_true",
                    help="Activer la correction F0 via WORLD vocoder en passe 6b "
                         "(par défaut : normalisation RMS seule, sans re-synthèse)")
+    p.add_argument("--finaliser", action="store_true",
+                   help="Finaliser le son de la vidéo produite (finaliser.py : "
+                        "bruit de fond, volume à la norme)")
     p.add_argument("--skip-video", action="store_true",
                    help="Produire uniquement l'audio mixé (pas de vidéo)")
     p.add_argument("--watermark", action="store_true",
@@ -6715,6 +6734,13 @@ def main():
             assemble_video(args.video, mixed_audio, output,
                            watermark=args.watermark,
                            skip_seconds=skip_seconds)
+
+        if args.finaliser:
+            if args.dual_audio:
+                # finaliser.py ne garde qu'une piste de son
+                print("\n   ⚠️  Deux pistes audio : le son n'est pas finalisé")
+            else:
+                finaliser_le_son(output)
 
         # ── Extraction auto de clips (vidéo doublée > 45 min) ──────────────
         # On part de la vidéo doublée pour que les clips portent l'audio doublé.

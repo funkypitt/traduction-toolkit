@@ -67,7 +67,7 @@ from traduire import (
     extract_audio, transcribe_whisperx, ocr_supplement_segments,
     analyze_content, translate_chunks,
     review_translation, check_consistency, verify_glossary,
-    resegment, generate_srt, burn_subtitles,
+    resegment, generate_srt, burn_subtitles, finaliser_le_son,
     save_seg, load_seg, save_bilingual, save_src_srt,
     generate_dubbing_ass, get_video_resolution, burn_dubbing_video,
     SUBTITLE_STYLES,
@@ -1896,6 +1896,9 @@ def main():
                         "sur un jingle musical / silence (activé par défaut)")
     p.add_argument("--skip-burn", action="store_true",
                    help="Ne pas incruster les sous-titres dans la vidéo")
+    p.add_argument("--finaliser", action="store_true",
+                   help="Finaliser le son de la vidéo produite (finaliser.py : "
+                        "bruit de fond, volume à la norme)")
     p.add_argument("--skip-summary", action="store_true",
                    help="Ne pas générer le résumé ni le kit promo")
     p.add_argument("--skip-review", action="store_true",
@@ -2197,6 +2200,8 @@ def main():
     # ────────────────────────────────────────────────────────────────────────
     if not args.skip_burn:
         burn_subtitles(args.source, srt_tgt, out_mp4, args.style, delogo=args.delogo)
+        if args.finaliser:
+            finaliser_le_son(out_mp4)
 
     if not args.no_dubbing:
         vw, vh = get_video_resolution(args.source)

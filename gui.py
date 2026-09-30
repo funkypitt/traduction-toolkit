@@ -127,6 +127,9 @@ def _llm(label="Texte confié à", claude="--claude-model", url=True, analyse=Fa
 
 
 WHISPER = C("whisper_model", "--whisper-model", "Modèle Whisper", adv=True)
+# Dernière étape facultative des scripts qui produisent une vidéo : finaliser.py
+FINALISER = C("finaliser", "--finaliser", "Finaliser le son (bruit de fond, volume à la norme)",
+              "toggle")
 CONTEXTE = C("context", "--context", "Contexte (noms propres, sujet…)", "textarea")
 STYLE = C("style", "--style", "Style des sous-titres", "select")
 
@@ -142,6 +145,7 @@ SCRIPTS = [
             *_llm(analyse=True),
             STYLE, CONTEXTE,
             C("dubbing", "--dubbing", "Doublage audio en plus", "toggle"),
+            FINALISER,
             C("skip_burn", "--skip-burn", "Fichier SRT seul, sans incrustation", "toggle"),
             C("skip_review", "--skip-review", "Sauter la relecture", "toggle"),
             C("output", "-o", "Vidéo produite", "file", adv=True),
@@ -178,6 +182,7 @@ SCRIPTS = [
             C("ref_voices", "--ref-voices", "Dossier de voix", "dir"),
             C("map_voices", "--map-voices", "Choisir la voix de chaque locuteur", "toggle"),
             C("clone_original", "--clone-original", "Cloner la voix d'origine", "toggle"),
+            FINALISER,
             C("gender", "--gender", "Genre des voix", "select",
               choices=["auto", "male", "female"],
               names={"auto": "estimé", "male": "homme", "female": "femme"}),
@@ -246,6 +251,7 @@ SCRIPTS = [
             *_llm(),
             C("no_dubbing", "--no-dubbing", "Sans doublage", "toggle"),
             C("audit_cuts", "--audit-cuts", "Contrôler les coupes", "toggle"),
+            FINALISER,
             C("num_speakers", "--num-speakers", "Nombre de locuteurs", "int"),
             C("skip_summary", "--skip-summary", "Sauter le résumé", "toggle", adv=True),
             C("skip_review", "--skip-review", "Sauter la relecture", "toggle", adv=True),
@@ -266,6 +272,7 @@ SCRIPTS = [
             C("video", None, "Vidéo", "source", required=True),
             C("docx", None, "Traduction (DOCX)", "file", required=True),
             STYLE,
+            FINALISER,
             C("srt_only", "--srt-only", "Fichier SRT seul, sans incrustation", "toggle"),
             *_llm(label="Calage confié à", claude=None),
             C("resume", "--resume", "Reprendre (segments calés, JSON)", "file", adv=True),
@@ -291,6 +298,7 @@ SCRIPTS = [
             C("target_lang", "-t", "Traduire en", placeholder="en, fr, ja…"),
             *_llm(label="Choix confié à"),
             CONTEXTE,
+            FINALISER,
             C("post", "--post", "Publier un extrait déjà fait", "toggle", adv=True),
             C("skip_burn", "--skip-burn", "Sans incrustation", "toggle", adv=True),
             C("words_per_group", "--words-per-group", "Mots affichés à la fois", "int", adv=True),
@@ -342,6 +350,48 @@ SCRIPTS = [
         ],
     },
     # ── Son ───────────────────────────────────────────────────────────────────
+    {
+        "id": "finaliser", "file": "finaliser.py", "groupe": "son",
+        "label": "Prêt à diffuser", "icon": "🎧",
+        "desc": "Finition podcast : silences, bruit de fond, volume à la norme",
+        "fields": [
+            C("entree", None, "Fichier son ou vidéo, ou dossier", "source", required=True),
+            C("sortie", "-o", "Dossier de sortie", "dir", placeholder="à côté de la source"),
+            C("format", "--format", "Produire", "select",
+              names={"auto": "selon la source (MP4 ou MP3)", "mp3": "un son MP3",
+                     "m4a": "un son M4A", "wav": "un son WAV", "mp4": "une vidéo MP4"}),
+            C("canaux", "--canaux", "Canaux", "select",
+              names={"mono": "mono (la norme pour la parole)", "stereo": "stéréo"}),
+            C("debruitage", "--debruitage", "Bruit de fond", "select",
+              names={"auto": "retiré s'il y en a un", "jamais": "ne pas y toucher",
+                     "toujours": "toujours débruiter"}),
+            C("nivelage", "--nivelage", "Niveaux de voix inégaux", "select",
+              names={"auto": "égalisés s'ils le sont beaucoup", "jamais": "ne pas y toucher",
+                     "toujours": "toujours égaliser"}),
+            C("analyse_seule", "--analyse-seule", "Diagnostic seulement, sans rien écrire", "toggle"),
+            C("sans_rognage", "--sans-rognage", "Garder les silences de début et de fin", "toggle"),
+            C("sur_place", "--sur-place", "Remplacer le fichier (même nom, même durée)", "toggle"),
+            C("titre", "--titre", "Titre"),
+            C("auteur", "--auteur", "Auteur"),
+            C("album", "--album", "Émission"),
+            C("debut", "--debut", "Commencer à (MM:SS)", adv=True, placeholder="au premier son"),
+            C("fin", "--fin", "Finir à (MM:SS)", adv=True, placeholder="au dernier son"),
+            C("fondu_debut", "--fondu-debut", "Fondu d'entrée (s)", "float", adv=True),
+            C("fondu_fin", "--fondu-fin", "Fondu de sortie (s)", "float", adv=True),
+            C("fondu_image", "--fondu-image", "Vidéo : fondu de l'image aussi", "toggle", adv=True),
+            C("lufs", "--lufs", "Volume visé (LUFS)", "float", adv=True,
+              placeholder="-19 en mono, -16 en stéréo"),
+            C("limiteur_max", "--limiteur-max", "Ce qu'on peut retirer aux crêtes (dB)", "float", adv=True),
+            C("reduction", "--reduction", "Atténuation du bruit, au plus (dB)", "int", adv=True,
+              placeholder="8, ou 12 si le fond est fort"),
+            C("debit", "--debit", "Débit du son (kbit/s)", "int", adv=True,
+              placeholder="128 en mono, 192 en stéréo"),
+            C("passe_haut", "--passe-haut", "Couper les graves sous (Hz)", "int", adv=True),
+            C("cpu", "--cpu", "Débruiter sans la carte graphique", "toggle", adv=True),
+            C("forcer", "--forcer", "Refaire même si le résultat existe", "toggle", adv=True),
+            C("garder_travail", "--garder-travail", "Garder les fichiers intermédiaires", "toggle", adv=True),
+        ],
+    },
     {
         "id": "nettoyer", "file": "nettoyer.py", "groupe": "son",
         "label": "Nettoyage", "icon": "🧹",
@@ -415,6 +465,13 @@ def _module(fichier):
         elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.value is not None:
             consts[n.target.id] = n.value
 
+    # import nettoyer as N → N.CONSTANTE se lit dans nettoyer.py
+    for n in arbre.body:
+        if isinstance(n, ast.Import):
+            for a in n.names:
+                if a.asname:
+                    consts["__alias__" + a.asname] = ast.Constant(a.name)
+
     options = {}
     _MODULES[chemin] = (mtime, consts, options)     # posé avant : les renvois entre scripts
     # Ce qu'un script emprunte à un autre (from traduire import SUBTITLE_STYLES)
@@ -454,7 +511,8 @@ def _valeur(n, consts, profondeur=0):
     if isinstance(n, ast.Name):
         return suite(consts[n.id]) if n.id in consts else INCONNU
     if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name):
-        autres, _ = _module(n.value.id + ".py")
+        alias = consts.get("__alias__" + n.value.id)
+        autres, _ = _module((alias.value if alias is not None else n.value.id) + ".py")
         return suite(autres[n.attr], autres) if n.attr in autres else INCONNU
     if isinstance(n, (ast.List, ast.Tuple)):
         vals = [suite(e) for e in n.elts]

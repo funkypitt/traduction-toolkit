@@ -1280,6 +1280,22 @@ def generate_karaoke_ass(clip: ClipSelection, ass_path: str,
 # PASSE 6 : INCRUSTATION (ffmpeg burn)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def finaliser_le_son(video: str):
+    """Option --finaliser : le son de la vidéo produite passe par finaliser.py
+    (fond, volume à la norme). La vidéo garde son nom et sa durée ; si la
+    finition échoue, elle est laissée telle qu'elle est."""
+    script = SCRIPT_DIR / "finaliser.py"
+    if not os.path.exists(video):
+        return
+    if not script.exists():
+        print("   ⚠️  finaliser.py est absent : le son n'est pas finalisé")
+        return
+    print(f"\n🎧 Finition du son : {os.path.basename(video)}", flush=True)
+    r = subprocess.run([sys.executable, str(script), video, "--sur-place"])
+    if r.returncode != 0:
+        print("   ⚠️  La finition du son a échoué : la vidéo est laissée telle quelle")
+
+
 def burn_subtitles(video_path: str, ass_path: str, output_path: str,
                    crop_filter: str = None) -> str:
     """Incruste le fichier ASS dans la vidéo.
@@ -1620,6 +1636,9 @@ def main():
                         "pour sauter la transcription WhisperX")
     p.add_argument("--skip-burn", action="store_true",
                    help="Générer les ASS sans les incruster")
+    p.add_argument("--finaliser", action="store_true",
+                   help="Finaliser le son des extraits produits (finaliser.py : "
+                        "bruit de fond, volume à la norme)")
     p.add_argument("--words-per-group", type=int, default=DEFAULT_WORDS_PER_GROUP,
                    help=f"Mots par groupe karaoke (défaut: {DEFAULT_WORDS_PER_GROUP})")
     p.add_argument("--context", type=str, default="",
@@ -1968,6 +1987,9 @@ def main():
                 crop = f"crop={sq}:{sq}:({w}-{sq})/2:0"
                 burn_subtitles(clip_raw, clip_ass_sq, clip_final_sq,
                                crop_filter=crop)
+                if args.finaliser:
+                    finaliser_le_son(clip_final_16)
+                    finaliser_le_son(clip_final_sq)
                 try:
                     os.remove(clip_raw)
                 except OSError:
@@ -1990,6 +2012,8 @@ def main():
                     os.rename(clip_raw, clip_final)
             else:
                 result = burn_subtitles(clip_raw, clip_ass, clip_final)
+                if result and args.finaliser:
+                    finaliser_le_son(clip_final)
                 if result:
                     try:
                         os.remove(clip_raw)

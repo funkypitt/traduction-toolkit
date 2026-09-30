@@ -3549,6 +3549,22 @@ def get_video_resolution(video_path: str) -> tuple[int, int]:
         return 1920, 1080  # fallback
 
 
+def finaliser_le_son(video: str):
+    """Option --finaliser : le son de la vidéo produite passe par finaliser.py
+    (fond, volume à la norme). La vidéo garde son nom et sa durée ; si la
+    finition échoue, elle est laissée telle qu'elle est."""
+    script = SCRIPT_DIR / "finaliser.py"
+    if not os.path.exists(video):
+        return
+    if not script.exists():
+        print("   ⚠️  finaliser.py est absent : le son n'est pas finalisé")
+        return
+    print(f"\n🎧 Finition du son : {os.path.basename(video)}", flush=True)
+    r = subprocess.run([sys.executable, str(script), video, "--sur-place"])
+    if r.returncode != 0:
+        print("   ⚠️  La finition du son a échoué : la vidéo est laissée telle quelle")
+
+
 def burn_dubbing_video(video: str, ass: str, output: str):
     """Incruste le fichier ASS de doublage dans la vidéo."""
     print(f"\n🎙️  Incrustation doublage...")
@@ -3667,7 +3683,8 @@ def _probe_duration(path: str) -> float:
         return 0.0
 
 
-def auto_clip_if_long(source_video: str, seg_json: str, tgt_lang: str):
+def auto_clip_if_long(source_video: str, seg_json: str, tgt_lang: str,
+                      finaliser: bool = False):
     """Si la vidéo dépasse AUTO_CLIP_THRESHOLD_SEC, invoque clipper.py
     en réutilisant les segments déjà transcrits/traduits (skip WhisperX)."""
     duration = _probe_duration(source_video)
@@ -3685,6 +3702,8 @@ def auto_clip_if_long(source_video: str, seg_json: str, tgt_lang: str):
            "--pre-segments", seg_json,
            "-n", str(AUTO_CLIP_COUNT),
            "--target-lang", tgt_lang]
+    if finaliser:
+        cmd.append("--finaliser")       # les extraits partent de la source
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
@@ -3725,6 +3744,9 @@ def main():
     p.add_argument("--skip-review", action="store_true", help="Passer la relecture")
     p.add_argument("--dubbing", action="store_true",
                    help="Générer un 2e MP4 pour le doublage (sous-titre actuel + prochain)")
+    p.add_argument("--finaliser", action="store_true",
+                   help="Finaliser le son de la vidéo produite (finaliser.py : "
+                        "bruit de fond, volume à la norme)")
     p.add_argument("--context", type=str, default="",
                    help="Contexte pour guider la traduction : noms, sujet, registre, etc. "
                         "Ex: --context \"Interview de Mary-Anne DeMasi, journaliste d'investigation\"")
@@ -3823,7 +3845,10 @@ def main():
         print("🎬 Incrustation d'un SRT existant")
         check_ffmpeg()
         burn_subtitles(args.source, args.srt_only, output, args.style,
-                       delogo=args.delogo); return
+                       delogo=args.delogo)
+        if args.finaliser:
+            finaliser_le_son(output)
+        return
 
     WHISPER_MODEL = args.whisper_model; CLAUDE_MODEL = args.claude_model
 
@@ -4002,7 +4027,9 @@ def main():
     if not args.skip_burn:
         burn_subtitles(args.source, srt_tgt, output, args.style,
                            delogo=args.delogo)
-    
+        if args.finaliser:
+            finaliser_le_son(output)
+
     # Passe 7 (optionnel) : version doublage
     if args.dubbing:
         vw, vh = get_video_resolution(args.source)
@@ -4019,7 +4046,7 @@ def main():
     # ── Extraction auto de clips (vidéo > 45 min) ──────────────────────────
     # On part de la source originale, jamais du fichier sous-titré incrusté :
     # les clips ne doivent porter que les sous-titres karaoke de clipper.py.
-    auto_clip_if_long(args.source, seg_json, tgt_lang)
+    auto_clip_if_long(args.source, seg_json, tgt_lang, finaliser=args.finaliser)
 
     el = time.time() - t0
     print(f"\n{'='*60}")
