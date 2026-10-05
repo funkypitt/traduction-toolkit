@@ -111,6 +111,13 @@ FONDU_DEBUT_S = 0.25
 FONDU_FIN_S = 0.6
 FONDU_MIN_S = 0.03              # anti-clic, quand le son commence ou finit au ras
 
+# Plages à faire taire (--taire) : remplacées par le fond de salle, pas par un
+# silence numérique (au casque, un trou s'entend autant qu'un bruit)
+FOND_SALLE_S = 3.0              # longueur du fond de salle prélevé…
+FOND_SALLE_VOISINAGE_S = 20.0   # … cherché dans la plage et autant autour
+FOND_SALLE_FONDU_S = 0.2        # entrée et sortie du fond, en demi-cosinus
+FOND_SALLE_RACCORD_S = 0.25     # recouvrement entre deux copies du fond
+
 ETENDUE_NIVELAGE_LU = 14.0      # au-delà, les niveaux sont trop inégaux
 # La parole brute a des crêtes 18 à 22 dB au-dessus de sa sonie : atteindre la
 # cible demande presque toujours de rogner quelques crêtes. Au-delà de
@@ -595,6 +602,16 @@ def decider(a, infos, args, canaux_sortie):
         raise RuntimeError("il ne resterait rien après le rognage")
     plan["debut_s"], plan["fin_s"] = round(debut, 3), round(fin, 3)
 
+    # Plages à faire taire, données sur le fichier d'origine ; gardées dans ce qui reste
+    plan["taire"] = []
+    for t0, t1 in (args.taire or []):
+        p0, p1 = max(t0, debut), min(t1, fin)
+        if p1 - p0 < 0.1:
+            plan["raisons"].append(f"plage à faire taire {hms(t0)} → {hms(t1)} hors du son gardé : ignorée")
+            continue
+        plan["taire"].append([round(p0, 3), round(p1, 3)])
+        plan["raisons"].append(f"{hms(p0)} → {hms(p1)} remplacé par le fond de salle")
+
     # Fondus : dans l'air qui précède le premier son et suit le dernier
     air_avant = max(0.0, a["premier_son_s"] - debut) if args.debut is None else args.fondu_debut
     air_apres = max(0.0, fin - a["dernier_son_s"]) if args.fin is None else args.fondu_fin
@@ -656,6 +673,96 @@ def rogner(wav_entree, wav_sortie, debut_s, fin_s):
                     break
                 reste -= len(x)
                 g.write(x)
+
+
+def taire(wav_entree, wav_sortie, plages, decalage_s):
+    """Remplace chaque plage par le fond de salle : le passage le plus calme
+    (sans la moindre pointe) de FOND_SALLE_S trouvé dans la plage ou à moins de
+    FOND_SALLE_VOISINAGE_S autour, recopié bout à bout (raccords à puissance
+    constante, une copie sur deux à l'envers pour casser toute périodicité),
+    fondu en entrée et en sortie. Les plages sont en secondes du fichier
+    d'origine ; `decalage_s` est ce que le rognage a retiré au début.
+    Renvoie, par plage, l'instant (sur l'origine) où le fond a été pris."""
+    import soundfile as sf
+    pris = []
+    with sf.SoundFile(str(wav_entree)) as f:
+        sr, total, canaux = f.samplerate, f.frames, f.channels
+
+        def lire(i0, i1):
+            f.seek(i0)
+            return f.read(i1 - i0, dtype="float32", always_2d=True)
+
+        remplacements = []
+        for t0, t1 in plages:
+            i0 = max(0, int(round((t0 - decalage_s) * sr)))
+            i1 = min(total, int(round((t1 - decalage_s) * sr)))
+            if i1 - i0 < int(0.1 * sr):
+                continue
+            # Le fond : la fenêtre dont la trame la plus forte est la plus basse
+            v0 = max(0, i0 - int(FOND_SALLE_VOISINAGE_S * sr))
+            v1 = min(total, i1 + int(FOND_SALLE_VOISINAGE_S * sr))
+            trame = int(0.1 * sr)
+            n_fond = min(int(FOND_SALLE_S * sr), i1 - i0, v1 - v0)
+            voisinage = lire(v0, v1)
+            n_trames = len(voisinage) // trame
+            rms = np.sqrt(np.mean(voisinage[:n_trames * trame].reshape(n_trames, trame, canaux) ** 2,
+                                  axis=(1, 2)) + 1e-20)
+            # Trois secondes de préférence ; plus court si rien d'aussi long n'est
+            # au ras du fond (à moins de 8 dB des trames les plus calmes du voisinage)
+            calme = np.percentile(rms, 2) * 10 ** (8 / 20)
+            fond, debut_fond = voisinage[:n_fond].copy(), v0 / sr
+            for longueur in (n_fond, int(1.5 * sr), int(1.0 * sr)):
+                k = max(1, min(longueur, n_fond) // trame)
+                if n_trames < k:
+                    continue
+                pointes = np.array([rms[j:j + k].max() for j in range(n_trames - k + 1)])
+                j = int(np.argmin(pointes))
+                fond = voisinage[j * trame:j * trame + k * trame].copy()
+                debut_fond = (v0 + j * trame) / sr
+                if pointes[j] <= calme:
+                    break
+            del voisinage
+            # Le fond mis bout à bout, à la longueur de la plage
+            n = i1 - i0
+            r = min(int(FOND_SALLE_RACCORD_S * sr), len(fond) // 4)
+            rampe = np.sin(0.5 * np.pi * np.linspace(0.0, 1.0, r, endpoint=False))[:, None]
+            tapis = np.zeros((n + len(fond), canaux), dtype=np.float32)
+            pos, copie = 0, 0
+            while pos < n:
+                bloc = fond if copie % 2 == 0 else fond[::-1]
+                morceau = bloc.copy()
+                if pos > 0 and r:
+                    morceau[:r] *= rampe
+                    tapis[pos:pos + r] *= rampe[::-1]
+                tapis[pos:pos + len(morceau)] += morceau
+                pos += len(fond) - r
+                copie += 1
+            tapis = tapis[:n]
+            # Entrée et sortie en demi-cosinus : l'original s'efface, le fond prend
+            g = np.ones(n, dtype=np.float64)
+            m = min(int(FOND_SALLE_FONDU_S * sr), n // 2)
+            if m > 1:
+                x = np.arange(n)
+                g *= 0.5 - 0.5 * np.cos(np.pi * np.clip(x / m, 0.0, 1.0))
+                g *= 0.5 - 0.5 * np.cos(np.pi * np.clip((n - x) / m, 0.0, 1.0))
+            remplacements.append((i0, i1, tapis, g[:, None].astype(np.float32)))
+            pris.append(round(debut_fond + decalage_s, 2))
+
+        with sf.SoundFile(str(wav_sortie), "w", samplerate=sr, channels=canaux,
+                          subtype="FLOAT") as out:
+            f.seek(0)
+            pos = 0
+            while pos < total:
+                x = f.read(min(sr * 10, total - pos), dtype="float32", always_2d=True)
+                fin_bloc = pos + len(x)
+                for i0, i1, tapis, g in remplacements:
+                    a, b = max(i0, pos), min(i1, fin_bloc)
+                    if a < b:
+                        xa, xb, ta, tb = a - pos, b - pos, a - i0, b - i0
+                        x[xa:xb] = x[xa:xb] * (1.0 - g[ta:tb]) + tapis[ta:tb] * g[ta:tb]
+                out.write(x)
+                pos = fin_bloc
+    return pris
 
 
 def poser_les_fondus(wav_entree, wav_sortie, fondu_debut_s, fondu_fin_s):
@@ -1040,6 +1147,15 @@ def traiter_fichier(fichier, args):
         wav_conditionne.unlink()
         duree = plan["fin_s"] - plan["debut_s"]
         print(f"        rognage      {hms(plan['debut_s'])} → {hms(plan['fin_s'])}")
+        if plan["taire"]:
+            # Sur les deux sons : celui qui sera traité et celui qui sert de référence
+            for wav in (wav_rogne, wav_pret):
+                tmp = wav.with_name(wav.stem + "_tu.wav")
+                pris = taire(wav, tmp, plan["taire"], plan["debut_s"])
+                tmp.replace(wav)
+            plan["fond_salle_pris_s"] = pris
+            for (t0, t1), t in zip(plan["taire"], pris):
+                print(f"        silence      {hms(t0)} → {hms(t1)} : fond de salle pris à {hms(t)}")
 
         # Passe 4 — débruitage, seulement s'il le faut
         if plan["debruitage"]:
@@ -1184,6 +1300,17 @@ def traiter_sur_place(fichier, args):
         shutil.rmtree(dossier, ignore_errors=True)
 
 
+def plage(texte):
+    """« 47:46-49:40 » → (secondes, secondes), sur le fichier d'origine."""
+    morceaux = texte.strip().split("-")
+    if len(morceaux) != 2:
+        raise argparse.ArgumentTypeError(f"plage illisible : {texte} (attendu DEBUT-FIN)")
+    a, b = instant(morceaux[0]), instant(morceaux[1])
+    if b <= a:
+        raise argparse.ArgumentTypeError(f"plage illisible : {texte} (la fin vient avant le début)")
+    return a, b
+
+
 def instant(texte):
     """« 90 », « 1:30 » ou « 1:02:03.5 » → secondes."""
     try:
@@ -1235,6 +1362,9 @@ def principal():
                          help="commencer à cet instant (au lieu du premier son)")
     parseur.add_argument("--fin", type=instant, default=None, metavar="MM:SS",
                          help="finir à cet instant (au lieu du dernier son)")
+    parseur.add_argument("--taire", type=plage, action="append", default=None, metavar="MM:SS-MM:SS",
+                         help="plage (sur le fichier d'origine) remplacée par le fond de salle : "
+                              "bruit dans la salle pendant un silence ; répétable")
     parseur.add_argument("--fondu-debut", type=float, default=FONDU_DEBUT_S, metavar="S",
                          help=f"fondu d'entrée, en secondes (défaut {FONDU_DEBUT_S})")
     parseur.add_argument("--fondu-fin", type=float, default=FONDU_FIN_S, metavar="S",

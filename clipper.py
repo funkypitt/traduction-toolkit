@@ -386,10 +386,59 @@ def acquire_gpu_lock():
     print("   🔒 Verrou GPU acquis")
 
 
+def wait_for_vram_release(min_free_mib: int = 6000, timeout: float = 60.0,
+                          poll: float = 1.5) -> bool:
+    """Attend que la VRAM soit RÉELLEMENT libérée avant de charger un autre
+    modèle GPU. `ollama stop` n'unmappe pas les ~20 Go instantanément : un
+    sleep fixe (2 s) ne suffit pas et provoque un CUDA OOM au chargement du TTS
+    (cf. test du 2026-06-23). On sonde nvidia-smi jusqu'à min_free_mib libres.
+    Renvoie True si le seuil est atteint, False sur timeout (on tente quand même).
+    """
+    deadline = time.time() + timeout
+    last_free = None
+    while time.time() < deadline:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.free",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10)
+            last_free = int(out.stdout.strip().splitlines()[0])
+        except Exception:
+            return True  # pas de nvidia-smi (CPU only) → inutile d'attendre
+        if last_free >= min_free_mib:
+            print(f"   ✅ VRAM libérée : {last_free} Mo disponibles")
+            return True
+        time.sleep(poll)
+    print(f"   ⚠️  VRAM encore basse après {timeout:.0f}s "
+          f"({last_free} Mo libres) — chargement tenté malgré tout")
+    return False
+
+
+def free_gpu_for_task(min_free_mib: int = 6000, timeout: float = 60.0):
+    """Garantit que la VRAM est libre AVANT de charger un gros modèle GPU
+    (WhisperX, TTS). Décharge tout modèle Ollama résident — y compris ceux
+    lancés hors toolkit (ex. open-webui) — puis VÉRIFIE via nvidia-smi.
+    Indispensable : un modèle Ollama résident (~20 Go) fait OOM le chargement
+    GPU suivant, et `ollama stop` ne libère pas la VRAM instantanément
+    (cf. test du 2026-06-23)."""
+    try:
+        ps = subprocess.run(["ollama", "ps"], capture_output=True,
+                            text=True, timeout=10)
+        for line in ps.stdout.splitlines()[1:]:
+            parts = line.split()
+            if parts:
+                subprocess.run(["ollama", "stop", parts[0]],
+                               capture_output=True, timeout=30)
+    except Exception:
+        pass
+    wait_for_vram_release(min_free_mib=min_free_mib, timeout=timeout)
+
+
 def transcribe_whisperx(audio_path: str, source_lang: Optional[str] = None,
                         hf_token: Optional[str] = None) -> tuple[list, str]:
     """Transcrit l'audio. Retourne (segments, langue_détectée)."""
     acquire_gpu_lock()
+    free_gpu_for_task(min_free_mib=6000, timeout=60)  # purge un Ollama résident avant WhisperX
     import whisperx, torch, gc
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1291,6 +1340,7 @@ def finaliser_le_son(video: str):
         print("   ⚠️  finaliser.py est absent : le son n'est pas finalisé")
         return
     print(f"\n🎧 Finition du son : {os.path.basename(video)}", flush=True)
+    free_gpu_for_task(min_free_mib=6000, timeout=60)  # le LLM local encore résident fait OOM le débruiteur
     r = subprocess.run([sys.executable, str(script), video, "--sur-place"])
     if r.returncode != 0:
         print("   ⚠️  La finition du son a échoué : la vidéo est laissée telle quelle")

@@ -48,8 +48,8 @@ Architecture en 7 passes :
                           · auto        DFN d'abord ; si le contrôle DNSMOS révèle
                                         une voix abîmée (SIG -0.10), bascule sur
                                         MossFormer2 (ou afftdn) et garde le meilleur
-  4. Nivelage (option)  → dynaudnorm très doux (fenêtre ~15 s, gain max 8x,
-                          seuil anti-amplification des silences)
+  4. Nivelage (option)  → gain mesuré sur la parole seule, tenu à travers les
+                          silences, lissé sur 15 s (−6/+12 dB)
   5. Normalisation      → mesure BS.1770 (pyloudnorm) puis GAIN CONSTANT
                           vers -19 LUFS (mono), plafond -1.5 dBTP vérifié
                           par suréchantillonnage 4x ; si la cible est
@@ -83,7 +83,7 @@ Usage :
 
 Prérequis (env conda `interview`) :
   pip install deepfilternet pyloudnorm speechmos
-  # + ffmpeg installé (loudnorm/ebur128/dynaudnorm/alimiter)
+  # + ffmpeg installé (loudnorm/ebur128/alimiter)
 """
 
 import argparse
@@ -126,7 +126,6 @@ EXCES_GAIN_REDUIT_DB = 2.0  # écart à la cible accepté avant de sortir le lim
 
 # Nivelage optionnel — réglages "toucher léger" (fenêtre ~15.5 s, gain max 8x,
 # seuil t pour ne jamais amplifier le fond de salle pendant les silences)
-DYNAUDNORM_DOUX = "dynaudnorm=f=500:g=31:p=0.9:m=8:t=0.02:o=0.3:b=1"
 
 MP3_QUALITE_VBR = 0         # LAME V0 — transparent pour la parole, avec marge
 
@@ -502,19 +501,74 @@ def debruiter(wav_conditionne, wav_decode, travail, args, rapport):
 # Passe 4 — Nivelage doux (optionnel)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def niveler(wav_entree, wav_sortie):
-    """dynaudnorm en réglages conservateurs.
+NIVELAGE_TRAME_S = 0.5          # pas de la courbe de gain
+NIVELAGE_SONIE_S = 3.0          # sonie courte sur laquelle le gain est calculé
+NIVELAGE_LISSAGE_S = 15.0       # fenêtre de lissage du gain (gaussienne, ±2 σ)
+NIVELAGE_PLAGE_DB = (-6.0, 12.0)   # ce que le nivelage peut retirer / ajouter
+NIVELAGE_PAROLE_DB = 15.0       # une trame est de la parole si elle dépasse le fond d'autant
 
-    Fenêtre effective ~15.5 s (f=500 ms × g=31) : le gain évolue trop
-    lentement pour pomper ou pour manger une fin de phrase à l'échelle
-    d'une syllabe. m=8 borne l'amplification, t=0.02 interdit d'amplifier
-    les trames sous le seuil (silences, fond de salle), b=1 évite
-    l'anomalie de gain en début/fin de fichier.
-    """
-    executer(
-        ["ffmpeg", "-y", "-hide_banner", "-i", str(wav_entree),
-         "-af", DYNAUDNORM_DOUX, "-c:a", "pcm_f32le", str(wav_sortie)],
-        "nivelage")
+
+def niveler(wav_entree, wav_sortie):
+    """Nivelage lent et doux, qui ne regarde que la parole.
+
+    dynaudnorm (utilisé jusqu'au 2026-10-05) faisait plonger son gain dans
+    chaque silence (option seuil), avec une rampe de 8 à 15 s de chaque côté :
+    toute fin de phrase suivie d'un long silence partait en fondu, et le
+    premier mot d'après revenait en fondu. Ici le gain n'est calculé que sur
+    les trames de parole (sonie courte sur NIVELAGE_SONIE_S, ramenée vers la
+    sonie médiane de la parole, dans NIVELAGE_PLAGE_DB), **tenu** à travers
+    les silences (interpolation entre la parole d'avant et celle d'après, sans
+    creux), puis lissé sur NIVELAGE_LISSAGE_S. Renvoie (gain min, gain max)
+    en dB, ou None si rien n'a été fait."""
+    import soundfile as sf
+    with sf.SoundFile(str(wav_entree)) as f:
+        sr, canaux, total = f.samplerate, f.channels, f.frames
+        pas = int(NIVELAGE_TRAME_S * sr)
+        morceaux = []
+        for bloc in f.blocks(blocksize=pas * 200, dtype="float32", always_2d=True):
+            mono = bloc.mean(axis=1)
+            n = len(mono) // pas
+            if n:
+                morceaux.append(10 * np.log10((mono[:n * pas].reshape(n, pas) ** 2).mean(axis=1) + 1e-12))
+    niveaux = np.concatenate(morceaux) if morceaux else np.array([])
+    nb = len(niveaux)
+    plancher = np.percentile(niveaux, 5) if nb else 0.0
+    parole = niveaux > max(plancher + NIVELAGE_PAROLE_DB, -60.0) if nb else np.array([], bool)
+    if parole.sum() < 4:
+        shutil.copy(str(wav_entree), str(wav_sortie))
+        return None
+    # Sonie courte de chaque trame de parole : moyenne d'énergie des trames de
+    # parole à moins de NIVELAGE_SONIE_S/2 autour (les silences n'y entrent pas)
+    idx = np.flatnonzero(parole)
+    demi = max(1, int(round(NIVELAGE_SONIE_S / NIVELAGE_TRAME_S / 2)))
+    energie = 10 ** (niveaux / 10)
+    sonie = np.empty(len(idx))
+    for j, i in enumerate(idx):
+        voisins = idx[(idx >= i - demi) & (idx <= i + demi)]
+        sonie[j] = 10 * np.log10(energie[voisins].mean())
+    cible = float(np.median(sonie))
+    gain_parole = np.clip(cible - sonie, *NIVELAGE_PLAGE_DB)
+    # Sur toute la durée : interpolé entre les trames de parole, tenu aux bords
+    gain = np.interp(np.arange(nb), idx, gain_parole)
+    # Lissage gaussien (±2 σ = la fenêtre), bords prolongés
+    sigma = NIVELAGE_LISSAGE_S / NIVELAGE_TRAME_S / 4
+    rayon = int(2 * sigma)
+    if rayon >= 1:
+        noyau = np.exp(-0.5 * (np.arange(-rayon, rayon + 1) / sigma) ** 2)
+        noyau /= noyau.sum()
+        gain = np.convolve(np.pad(gain, rayon, mode="edge"), noyau, mode="valid")
+    centres = (np.arange(nb) + 0.5) * pas
+    with sf.SoundFile(str(wav_entree)) as f, \
+            sf.SoundFile(str(wav_sortie), "w", samplerate=sr, channels=canaux, subtype="FLOAT") as g:
+        pos = 0
+        while pos < total:
+            x = f.read(min(sr * 10, total - pos), dtype="float32", always_2d=True)
+            if not len(x):
+                break
+            lin = 10 ** (np.interp(np.arange(pos, pos + len(x)), centres, gain) / 20)
+            g.write((x * lin[:, None].astype(np.float32)))
+            pos += len(x)
+    return float(gain.min()), float(gain.max())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -553,7 +607,9 @@ def normaliser(wav_entree, wav_sortie, lufs_cible, rapport):
     audio, sr = sf.read(str(wav_entree), dtype="float32")
     metre = pyln.Meter(sr)
     lufs = metre.integrated_loudness(audio)
-    tp = mesurer_crete_vraie(audio, sr)
+    # mesurer_crete_vraie veut (canaux, trames) : en stéréo, lui donner (trames, 2)
+    # lui faisait parcourir chaque trame comme un canal (3 min 30 pour 1 min de son)
+    tp = mesurer_crete_vraie(audio.T if audio.ndim > 1 else audio, sr)
 
     if lufs < -55:
         raise RuntimeError(f"Fichier quasi muet ({lufs:.1f} LUFS) — vérifier la source")

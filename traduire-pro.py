@@ -635,6 +635,7 @@ def fill_transcription_gaps(segments: list[Segment], audio_path: str,
     is_multi = len(source_langs) > 1
     wx_lang = None if is_multi else source_langs[0]
 
+    traduire.free_gpu_for_task(min_free_mib=6000, timeout=60)  # purge un Ollama résident avant WhisperX
     print(f"   📥 Chargement WhisperX {traduire.WHISPER_MODEL} ({device}) pour récupération…")
     model = whisperx.load_model(traduire.WHISPER_MODEL, device,
                                  compute_type=compute_type, language=wx_lang)
@@ -1907,6 +1908,11 @@ def main():
                    help=f"Plafond CPS (défaut PRO : {MAX_CPS_PRO})")
     p.add_argument("--delogo", metavar="X:Y:W:H",
                    help="Supprimer un watermark via ffmpeg delogo (X:Y:W:H)")
+    p.add_argument("--couvrir-captions", nargs="?", const="auto", default=None,
+                   metavar="X:Y:W:H",
+                   help="Couvrir les sous-titres déjà incrustés dans l'image : leur zone "
+                        "est repérée par OCR (ou donnée en pixels, X:Y:W:H), masquée, et "
+                        "la traduction est posée dessus sur fond noir")
     p.add_argument("--whisper-model", default=traduire.WHISPER_MODEL)
     p.add_argument("--claude-model", default=CLAUDE_MODEL_PRO,
                    help=f"Modèle Claude (défaut : {CLAUDE_MODEL_PRO})")
@@ -2199,7 +2205,10 @@ def main():
     # PASSE 8 — Incrustation vidéo (sous-titres + ASS doubleur)
     # ────────────────────────────────────────────────────────────────────────
     if not args.skip_burn:
-        burn_subtitles(args.source, srt_tgt, out_mp4, args.style, delogo=args.delogo)
+        burn_subtitles(args.source, srt_tgt, out_mp4, args.style, delogo=args.delogo,
+                       cover=traduire.caption_zone_from_arg(
+                           args.couvrir_captions, args.source,
+                           [x.strip() for x in args.source_lang.lower().split(",")]))
         if args.finaliser:
             finaliser_le_son(out_mp4)
 

@@ -6,7 +6,8 @@ gui.py — Panneau de contrôle web pour la boîte à outils de traduction/doubl
 Lance un petit serveur local (Flask) qui présente, pour chaque script du repo,
 un formulaire : champs, listes déroulantes, interrupteurs, sélecteur de
 fichiers, aperçu de la commande et console de sortie en direct. Le montage au
-stabilo (monter.py) y est intégré comme une page à part entière.
+stabilo (monter.py) et le podcast enpleineconscience.ch (epc.py) y sont
+intégrés comme des pages à part entière.
 
     ~/miniconda3/envs/interview/bin/python gui.py
     → ouvre http://127.0.0.1:5005
@@ -286,6 +287,16 @@ SCRIPTS = [
         "desc": "Surligner le texte, le montage suit",
     },
     {
+        "id": "epc", "file": "epc.py", "groupe": "monter", "page": "/epc/",
+        "label": "Podcast enpleineconscience.ch", "icon": "🎙️",
+        "desc": "D'une vidéo à l'épisode publié et à la vidéo habillée",
+    },
+    {
+        "id": "youtube", "file": "epc.py", "groupe": "monter", "page": "/epc/youtube/",
+        "label": "Publier une vidéo sur YouTube", "icon": "▶️",
+        "desc": "Une vidéo déjà montée sur la chaîne, avec sa miniature",
+    },
+    {
         "id": "clipper", "file": "clipper.py", "groupe": "monter",
         "label": "Extraits choisis", "icon": "✂️",
         "desc": "Trouve les meilleurs passages, sous-titres mot à mot",
@@ -559,7 +570,7 @@ def scripts_resolus():
     for spec in SCRIPTS:
         if not os.path.exists(os.path.join(SCRIPT_DIR, spec["file"])):
             continue
-        if spec.get("page") and not MONTAGE_DISPONIBLE:
+        if spec.get("page") and not PAGES_DISPONIBLES.get(spec["page"]):
             continue
         s = dict(spec)
         s["groupe_nom"] = dict(GROUPES).get(spec.get("groupe"), "")
@@ -884,15 +895,22 @@ def browse(path):
 
 app = Flask(__name__)
 
-# Le montage au stabilo est une page à part, servie par ce même serveur.
-try:
-    import monter
-    app.register_blueprint(monter.creer_blueprint(), url_prefix="/montage")
-    MONTAGE_DISPONIBLE = True
-except Exception as _ex:                    # monter.py absent (dépôt public) ou cassé
-    MONTAGE_DISPONIBLE = False
-    if os.path.exists(os.path.join(SCRIPT_DIR, "monter.py")):
-        print(f"⚠️  Montage au stabilo indisponible : {_ex}")
+# Le montage au stabilo et le podcast enpleineconscience.ch sont des pages à
+# part, servies par ce même serveur.
+PAGES_DISPONIBLES = {}
+for _nom, _prefixe, _titre in (("monter", "/montage", "Montage au stabilo"),
+                               ("epc", "/epc", "Podcast enpleineconscience.ch")):
+    try:
+        _mod = __import__(_nom)
+        app.register_blueprint(_mod.creer_blueprint(), url_prefix=_prefixe)
+        PAGES_DISPONIBLES[_prefixe + "/"] = True
+    except Exception as _ex:                # fichier absent (dépôt public) ou cassé
+        PAGES_DISPONIBLES[_prefixe + "/"] = False
+        if os.path.exists(os.path.join(SCRIPT_DIR, _nom + ".py")):
+            print(f"⚠️  {_titre} indisponible : {_ex}")
+MONTAGE_DISPONIBLE = PAGES_DISPONIBLES["/montage/"]
+# La page YouTube est servie par le même module que le podcast.
+PAGES_DISPONIBLES["/epc/youtube/"] = PAGES_DISPONIBLES["/epc/"]
 
 
 def _run_ou_404(run_id):
@@ -1076,7 +1094,7 @@ a{color:var(--accent)}
 #header h1{font-size:17px;margin:0}
 #header .sub{color:var(--muted);font-size:12px}
 #body{flex:1;display:flex;min-height:0}
-#cadre{flex:1;border:none;width:100%;min-height:0;background:var(--bg)}
+#cadre,iframe.cadre-page{flex:1;border:none;width:100%;min-height:0;background:var(--bg)}
 
 /* Form column */
 #formwrap{flex:1;overflow-y:auto;padding:20px 22px;min-width:0}
@@ -1269,7 +1287,18 @@ function select(id){
   $('#h-desc').textContent=current.desc;
   const page=!!current.page;
   $('#cadre').hidden=!page; $('#body').hidden=page; $('#header').hidden=page;
-  if(page){ if(!$('#cadre').src) $('#cadre').src=current.page; return; }
+  if(page){
+    // Un cadre par page embarquée, créé à la première visite et gardé ensuite :
+    // on passe de l'une à l'autre sans perdre le projet ouvert dans chacune.
+    document.querySelectorAll('iframe.cadre-page').forEach(f=>f.hidden=f.dataset.page!==current.page);
+    if(!document.querySelector('iframe.cadre-page[data-page="'+current.page+'"]')){
+      const f=document.createElement('iframe'); f.className='cadre-page'; f.dataset.page=current.page; f.title=current.label; f.src=current.page;
+      $('#cadre').insertAdjacentElement('afterend',f);
+    }
+    $('#cadre').hidden=true;
+    return;
+  }
+  document.querySelectorAll('iframe.cadre-page').forEach(f=>f.hidden=true);
   values={};
   current.fields.forEach(f=>{ values[f.name]= 'default' in f ? f.default : (f.type==='toggle'?false:''); });
   advOpen=false;

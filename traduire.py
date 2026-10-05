@@ -1038,11 +1038,60 @@ def acquire_gpu_lock():
     print("   🔒 Verrou GPU acquis")
 
 
+def wait_for_vram_release(min_free_mib: int = 6000, timeout: float = 60.0,
+                          poll: float = 1.5) -> bool:
+    """Attend que la VRAM soit RÉELLEMENT libérée avant de charger un autre
+    modèle GPU. `ollama stop` n'unmappe pas les ~20 Go instantanément : un
+    sleep fixe (2 s) ne suffit pas et provoque un CUDA OOM au chargement du TTS
+    (cf. test du 2026-06-23). On sonde nvidia-smi jusqu'à min_free_mib libres.
+    Renvoie True si le seuil est atteint, False sur timeout (on tente quand même).
+    """
+    deadline = time.time() + timeout
+    last_free = None
+    while time.time() < deadline:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.free",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10)
+            last_free = int(out.stdout.strip().splitlines()[0])
+        except Exception:
+            return True  # pas de nvidia-smi (CPU only) → inutile d'attendre
+        if last_free >= min_free_mib:
+            print(f"   ✅ VRAM libérée : {last_free} Mo disponibles")
+            return True
+        time.sleep(poll)
+    print(f"   ⚠️  VRAM encore basse après {timeout:.0f}s "
+          f"({last_free} Mo libres) — chargement tenté malgré tout")
+    return False
+
+
+def free_gpu_for_task(min_free_mib: int = 6000, timeout: float = 60.0):
+    """Garantit que la VRAM est libre AVANT de charger un gros modèle GPU
+    (WhisperX, TTS). Décharge tout modèle Ollama résident — y compris ceux
+    lancés hors toolkit (ex. open-webui) — puis VÉRIFIE via nvidia-smi.
+    Indispensable : un modèle Ollama résident (~20 Go) fait OOM le chargement
+    GPU suivant, et `ollama stop` ne libère pas la VRAM instantanément
+    (cf. test du 2026-06-23)."""
+    try:
+        ps = subprocess.run(["ollama", "ps"], capture_output=True,
+                            text=True, timeout=10)
+        for line in ps.stdout.splitlines()[1:]:
+            parts = line.split()
+            if parts:
+                subprocess.run(["ollama", "stop", parts[0]],
+                               capture_output=True, timeout=30)
+    except Exception:
+        pass
+    wait_for_vram_release(min_free_mib=min_free_mib, timeout=timeout)
+
+
 def transcribe_whisperx(audio_path: str, source_lang: str = "en",
                         hf_token: Optional[str] = None,
                         vad_onset: Optional[float] = None,
                         vad_offset: Optional[float] = None) -> list[Segment]:
     acquire_gpu_lock()
+    free_gpu_for_task(min_free_mib=6000, timeout=60)  # purge un Ollama résident avant WhisperX
     import whisperx, torch, gc
 
     source_langs = [x.strip() for x in source_lang.split(",")]
@@ -3312,8 +3361,180 @@ def _scale_style_for_height(style_str: str, video_height: int) -> str:
     return _scale_style_for_video(style_str, int(video_height * 16 / 9), video_height)
 
 
+# ── Couverture des sous-titres déjà incrustés dans l'image ────────────────────
+COVER_SAMPLES = 30          # images sondées, réparties sur la durée
+COVER_STATIC_SHARE = 0.35   # un texte vu au même endroit sur 35 % des images = logo, pas sous-titre
+
+
+def _parse_cover_zone(zone: str, video_width: int, video_height: int):
+    """X:Y:W:H en pixels → (x, y, w, h) borné à l'image, ou None."""
+    try:
+        x, y, w, h = (int(v) for v in zone.split(":"))
+    except ValueError:
+        print(f"   ⚠️  --couvrir-captions ignoré (format attendu: X:Y:W:H, reçu: {zone})")
+        return None
+    x, y = max(0, x), max(0, y)
+    w, h = min(w, video_width - x), min(h, video_height - y)
+    if w <= 0 or h <= 0:
+        print(f"   ⚠️  --couvrir-captions ignoré (zone hors de l'image : {zone})")
+        return None
+    return x, y, w, h
+
+
+def detect_caption_zone(video: str, source_langs=None):
+    """Repère par OCR la zone où la vidéo affiche déjà ses propres sous-titres.
+
+    Un sous-titre incrusté change de texte mais revient toujours dans la même
+    bande, au centre de l'image ; un logo ou un titre garde le même cadre d'une
+    image à l'autre. On sonde COVER_SAMPLES images, on écarte les textes fixes
+    et ceux des bords, et on garde la bande horizontale la plus fréquentée.
+    Renvoie (x, y, w, h) en pixels, marges comprises, ou None si rien de net.
+    """
+    import easyocr, torch, gc
+
+    print("\n🔎 Recherche des sous-titres déjà incrustés...")
+    vw, vh = _get_video_dimensions(video)
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", video], capture_output=True, text=True)
+        duration = float(r.stdout.strip())
+    except Exception:
+        duration = 0.0
+    if duration < 2:
+        print("   ⚠️  Vidéo trop courte pour chercher : rien n'est couvert")
+        return None
+
+    # Le LLM local peut encore occuper la mémoire vidéo (cf. free_gpu_for_task)
+    acquire_gpu_lock()
+    free_gpu_for_task(min_free_mib=4000, timeout=60)
+    use_gpu = torch.cuda.is_available()
+    try:
+        reader = easyocr.Reader(list(source_langs or ["en"]), gpu=use_gpu, verbose=False)
+    except Exception:
+        reader = easyocr.Reader(["en"], gpu=use_gpu, verbose=False)
+
+    # Au-delà de 1080 de haut, l'OCR lit une image réduite
+    scale = min(1.0, 1080 / vh)
+    vf = [] if scale == 1.0 else ["-vf", f"scale=-2:{round(vh * scale)}"]
+    n = max(6, min(COVER_SAMPLES, int(duration / 0.5)))
+    frames = []   # par image : liste de (x0, y0, x1, y1) en pixels de la vidéo
+    with tempfile.TemporaryDirectory(prefix="cover_") as tmpdir:
+        for i in range(n):
+            ts = duration * (0.03 + 0.94 * (i + 0.5) / n)
+            frame_path = os.path.join(tmpdir, f"frame_{i}.png")
+            subprocess.run(
+                ["ffmpeg", "-y", "-ss", f"{ts:.3f}", "-i", video, *vf,
+                 "-frames:v", "1", frame_path], capture_output=True)
+            if not os.path.exists(frame_path):
+                continue
+            boxes = []
+            for (bbox, txt, conf) in reader.readtext(frame_path, detail=1, paragraph=False):
+                if conf < 0.3 or len(txt.strip()) < 3:
+                    continue
+                xs = [p[0] / scale for p in bbox]
+                ys = [p[1] / scale for p in bbox]
+                x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+                # Les coins sont le domaine des logos et des noms de compte
+                if not 0.15 <= (x0 + x1) / 2 / vw <= 0.85:
+                    continue
+                boxes.append((x0, y0, x1, y1))
+            frames.append(boxes)
+    del reader
+    gc.collect()
+    if use_gpu:
+        torch.cuda.empty_cache()
+
+    if not frames:
+        print("   ⚠️  Aucune image lisible : rien n'est couvert")
+        return None
+
+    # Textes fixes : même cadre (à 1 % de la largeur près) sur beaucoup d'images
+    tol = max(4, vw * 0.01)
+    def same(a, b):
+        return all(abs(a[k] - b[k]) <= tol for k in range(4))
+    moving = []
+    for i, boxes in enumerate(frames):
+        for b in boxes:
+            seen = sum(1 for j, other in enumerate(frames)
+                       if j != i and any(same(b, o) for o in other))
+            if seen + 1 < max(3, COVER_STATIC_SHARE * len(frames)):
+                moving.append(b)
+
+    rows = [0] * (vh + 1)
+    for boxes in frames:
+        covered = set()
+        for b in boxes:
+            if b in moving:
+                covered.update(range(max(0, int(b[1])), min(vh, int(b[3])) + 1))
+        for y in covered:
+            rows[y] += 1
+    peak = max(rows)
+    if peak < max(3, 0.15 * len(frames)):
+        print("   ℹ️  Pas de sous-titres incrustés repérés : rien n'est couvert")
+        return None
+
+    # Bande continue autour de la ligne la plus fréquentée ; les lignes rares
+    # (3e ligne d'un sous-titre long) y restent tant qu'elles la touchent
+    floor = max(2, 0.08 * peak)
+    top = bottom = rows.index(peak)
+    while top > 0 and rows[top - 1] >= floor:
+        top -= 1
+    while bottom < vh and rows[bottom + 1] >= floor:
+        bottom += 1
+    in_band = [b for b in moving if top <= (b[1] + b[3]) / 2 <= bottom]
+    line_h = sorted(b[3] - b[1] for b in in_band)[len(in_band) // 2]
+    left = min(b[0] for b in in_band)
+    right = max(b[2] for b in in_band)
+
+    # Marges : une ligne en hauteur (ligne en plus, texte qui s'anime), un peu plus en largeur
+    x = max(0, int(left - 1.2 * line_h))
+    y = max(0, int(top - line_h))
+    w = min(vw, int(right + 1.2 * line_h)) - x
+    h = min(vh, int(bottom + line_h)) - y
+    print(f"   ✅ Sous-titres d'origine vus sur {peak} images sur {len(frames)} : "
+          f"zone {x}:{y}:{w}:{h}")
+    return x, y, w, h
+
+
+def caption_zone_from_arg(value, video: str, source_langs=None):
+    """Option --couvrir-captions : « auto » (recherche par OCR) ou X:Y:W:H."""
+    if not value:
+        return None
+    if value == "auto":
+        return detect_caption_zone(video, source_langs)
+    return _parse_cover_zone(value, *_get_video_dimensions(video))
+
+
+def _cover_style(style_str: str, srt: str, cover, video_height: int) -> str:
+    """Style d'un sous-titre posé SUR la zone à couvrir : fond noir opaque,
+    texte accroché en haut de la zone (il s'étend vers le bas)."""
+    import re
+    keep = [kv for kv in style_str.split(",")
+            if kv.split("=")[0] not in ("BackColour", "OutlineColour", "BorderStyle",
+                                        "Outline", "Shadow", "MarginV", "Alignment")]
+    m = re.search(r"FontSize=(\d+)", style_str)
+    # libass rend un SRT sur une grille de 288 lignes : FontSize et MarginV s'y expriment
+    line_px = int(m.group(1)) * video_height / 288 if m else video_height / 12
+    try:
+        with open(srt, encoding="utf-8") as f:
+            cues = re.split(r"\n\s*\n", f.read().strip())
+        max_lines = max(len(c.splitlines()) - 2 for c in cues)
+    except Exception:
+        max_lines = 2
+    x, y, w, h = cover
+    if y + max_lines * line_px > video_height - 8:
+        # Zone tout en bas : le texte déborderait de l'image, on l'accroche au bord bas
+        place = ["Alignment=2", "MarginV=4"]
+    else:
+        # Numérotation SSA d'origine dans force_style : 6 = en haut, centré
+        place = ["Alignment=6", f"MarginV={round(y * 288 / video_height)}"]
+    return ",".join(keep + ["BackColour=&H00000000", "BorderStyle=4",
+                            "Outline=0", "Shadow=0"] + place)
+
+
 def burn_subtitles(video: str, srt: str, output: str, style: str = "default",
-                   delogo: str = None):
+                   delogo: str = None, cover=None):
     print(f"\n🎬 Incrustation (style: {style})...")
     import shutil, tempfile
     fs = SUBTITLE_STYLES.get(style, SUBTITLE_STYLES["default"])
@@ -3330,10 +3551,15 @@ def burn_subtitles(video: str, srt: str, output: str, style: str = "default",
     tmp_dir = tempfile.mkdtemp()
     tmp_srt = os.path.join(tmp_dir, "subs.srt")
     shutil.copy2(srt, tmp_srt)
-    # Build video filter chain: optional delogo + subtitles
+    # Build video filter chain: optional delogo + cache des sous-titres d'origine + subtitles
     delogo_f = _parse_delogo(delogo)
+    cover_f = None
+    if cover:
+        fs = _cover_style(fs, srt, cover, video_height)
+        cover_f = "drawbox=x={}:y={}:w={}:h={}:color=black:t=fill".format(*cover)
+        print("   ▪️  Sous-titres d'origine couverts : fond noir, texte posé sur leur zone")
     sub_f = f"subtitles={tmp_srt}:force_style='{fs}'"
-    vf = ",".join(filter(None, [delogo_f, sub_f]))
+    vf = ",".join(filter(None, [delogo_f, cover_f, sub_f]))
     try:
         cmd = ["ffmpeg", "-y", "-i", video,
                "-vf", vf,
@@ -3344,7 +3570,7 @@ def burn_subtitles(video: str, srt: str, output: str, style: str = "default",
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print("   ⚠️  Retry sans style...")
-            vf2 = ",".join(filter(None, [delogo_f, f"subtitles={tmp_srt}"]))
+            vf2 = ",".join(filter(None, [delogo_f, cover_f, f"subtitles={tmp_srt}"]))
             cmd2 = ["ffmpeg", "-y", "-i", video, "-vf", vf2,
                     "-c:v", "libx264", "-crf", "18",
                     "-c:a", "aac", "-b:a", "192k", "-ac", "2",
@@ -3560,6 +3786,7 @@ def finaliser_le_son(video: str):
         print("   ⚠️  finaliser.py est absent : le son n'est pas finalisé")
         return
     print(f"\n🎧 Finition du son : {os.path.basename(video)}", flush=True)
+    free_gpu_for_task(min_free_mib=6000, timeout=60)  # le LLM local encore résident fait OOM le débruiteur
     r = subprocess.run([sys.executable, str(script), video, "--sur-place"])
     if r.returncode != 0:
         print("   ⚠️  La finition du son a échoué : la vidéo est laissée telle quelle")
@@ -3766,6 +3993,11 @@ def main():
     p.add_argument("--delogo", metavar="X:Y:W:H",
                    help="Supprimer un watermark (ex: NotebookLM) via ffmpeg delogo. "
                         "Format: X:Y:W:H en pixels (ex: 1060:685:210:30)")
+    p.add_argument("--couvrir-captions", nargs="?", const="auto", default=None,
+                   metavar="X:Y:W:H",
+                   help="Couvrir les sous-titres déjà incrustés dans l'image : leur zone "
+                        "est repérée par OCR (ou donnée en pixels, X:Y:W:H), masquée, et "
+                        "la traduction est posée dessus sur fond noir")
     p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
     p.add_argument("--vad-onset", type=float, default=None,
                    help="Seuil VAD onset (défaut WhisperX: 0.500). Augmenter (ex: 0.6-0.7) "
@@ -3845,7 +4077,9 @@ def main():
         print("🎬 Incrustation d'un SRT existant")
         check_ffmpeg()
         burn_subtitles(args.source, args.srt_only, output, args.style,
-                       delogo=args.delogo)
+                       delogo=args.delogo,
+                       cover=caption_zone_from_arg(args.couvrir_captions, args.source,
+                                                   source_langs))
         if args.finaliser:
             finaliser_le_son(output)
         return
@@ -4026,7 +4260,9 @@ def main():
     generate_srt(subtitles, srt_tgt)
     if not args.skip_burn:
         burn_subtitles(args.source, srt_tgt, output, args.style,
-                           delogo=args.delogo)
+                           delogo=args.delogo,
+                           cover=caption_zone_from_arg(args.couvrir_captions, args.source,
+                                                       source_langs))
         if args.finaliser:
             finaliser_le_son(output)
 

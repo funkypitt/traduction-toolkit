@@ -239,6 +239,11 @@ python traduire.py video.mp4 -s ja -t en
 # Avec style Netflix (ligne courtes, CPS contrôlé)
 python traduire.py video.mp4 --style netflix
 
+# La vidéo affiche déjà ses propres sous-titres (TikTok…) : leur zone est
+# repérée, masquée, et la traduction posée par-dessus sur fond noir
+python traduire.py video.mp4 --couvrir-captions
+python traduire.py video.mp4 --couvrir-captions 130:720:316:124   # zone donnée à la main (X:Y:L:H)
+
 # Produire seulement le SRT (pas de vidéo)
 python traduire.py video.mp4 --skip-burn
 

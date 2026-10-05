@@ -1434,10 +1434,15 @@ Réponds UNIQUEMENT en JSON, sans markdown."""
     return data
 
 
-def translate_for_dubbing(segments, analysis, client, src_lang, tgt_lang, context=""):
+def translate_for_dubbing(segments, analysis, client, src_lang, tgt_lang, context="",
+                          sauvegarde=None):
     """
     Traduction optimisée pour le doublage (style oral, concision).
     Contrairement au sous-titrage, on privilégie le naturel parlé.
+
+    sauvegarde(segments) est appelée après chaque bloc traduit : une heure
+    d'entretien, c'est une demi-heure de traduction locale, à ne pas perdre
+    en entier si le processus est tué en route.
     """
     print(f"\n🌍 Passe 4b — Traduction pour doublage {src_lang}→{tgt_lang}...")
 
@@ -1558,6 +1563,8 @@ original si chant/prière). Pas de commentaire, pas de préfixe."""
             _retry_missing(segments, s, e, system, client, src_lang, tgt_lang)
 
         print(f"   ✅ {sum(1 for seg in segments[s:e] if seg.text_tgt)}/{e-s}")
+        if sauvegarde:
+            sauvegarde(segments)
 
     total = sum(1 for s in segments if s.text_tgt)
     print(f"\n   🌍 Traduit : {total}/{len(segments)}")
@@ -5493,6 +5500,7 @@ def finaliser_le_son(video: str):
         print("   ⚠️  finaliser.py est absent : le son n'est pas finalisé")
         return
     print(f"\n🎧 Finition du son : {os.path.basename(video)}", flush=True)
+    free_gpu_for_task(min_free_mib=6000, timeout=60)  # le LLM local encore résident fait OOM le débruiteur
     r = subprocess.run([sys.executable, str(script), video, "--sur-place"])
     if r.returncode != 0:
         print("   ⚠️  La finition du son a échoué : la vidéo est laissée telle quelle")
@@ -5631,8 +5639,12 @@ def save_segments(segs: list[DubSegment], path: str):
         if s.words:
             d["words"] = s.words
         data.append(d)
-    with open(path, "w", encoding="utf-8") as f:
+    # Écrit à côté puis mis en place d'un coup : un arrêt brutal en pleine
+    # écriture ne laisse pas un segments.json tronqué (transcription perdue).
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
     print(f"   💾 → {path}")
 
 
@@ -6539,13 +6551,25 @@ def main():
             args.context = (apollo_ctx + "\n\n" + args.context).strip() if args.context else apollo_ctx
 
     # ── PASSE 4 : Analyse + Traduction ──────────────────────────────────────
-    if not any(s.text_tgt for s in segments):
-        analysis = analyze_content(segments, analysis_client, src_lang, tgt_lang, args.context)
-        with open(ana_json, "w", encoding="utf-8") as f:
-            json.dump(analysis, f, ensure_ascii=False, indent=2)
+    # Témoin posé pendant la passe 4. S'il est encore là au lancement, elle a
+    # été interrompue : segments.json n'est traduit qu'en partie, la traduction
+    # reprend au premier bloc manquant, avec l'analyse déjà faite.
+    en_cours = os.path.join(work_dir, "traduction_en_cours")
+    interrompue = os.path.exists(en_cours)
+    if interrompue or not any(s.text_tgt for s in segments):
+        if interrompue and os.path.exists(ana_json):
+            print(f"\n🔄 Traduction interrompue — reprise "
+                  f"({sum(1 for s in segments if s.text_tgt)}/{len(segments)} déjà traduits)")
+            with open(ana_json) as f: analysis = json.load(f)
+        else:
+            analysis = analyze_content(segments, analysis_client, src_lang, tgt_lang, args.context)
+            with open(ana_json, "w", encoding="utf-8") as f:
+                json.dump(analysis, f, ensure_ascii=False, indent=2)
+        open(en_cours, "w").close()
 
         segments = translate_for_dubbing(segments, analysis, claude,
-                                         src_lang, tgt_lang, args.context)
+                                         src_lang, tgt_lang, args.context,
+                                         sauvegarde=lambda segs: save_segments(segs, seg_json))
         save_segments(segments, seg_json)
 
         # ── PASSE 4c : Relecture ────────────────────────────────────────────
@@ -6555,6 +6579,7 @@ def main():
             save_segments(segments, seg_json)
         else:
             print(f"\n⏩ Relecture sautée")
+        os.remove(en_cours)
     else:
         print(f"\n⏩ Traduction déjà présente — passe 4 sautée")
         if os.path.exists(ana_json):
