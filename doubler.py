@@ -181,6 +181,11 @@ VO_TTS_TARGET_DBFS = -16            # niveau cible de la voix doublée (premier 
 VO_ORIG_BETWEEN_DB = -2             # légère atténuation de la voix originale entre segments
 VO_MAX_BRIDGE_GAP_MS = 800          # gap original max pour considérer une phrase continue
 VO_MAX_DRIFT_MS = 1500              # dérive max tolérée pour le push-later cascade (anti-troncature)
+VO_MAX_AHEAD_MS = 3000              # un clip collé ne prend jamais plus d'avance que ça sur le début
+                                    # original de son segment : sans ce plafond, une longue énumération
+                                    # (une seule phrase sur quatorze segments) collée bout à bout prenait
+                                    # une minute d'avance (clips plus courts que l'original + collage sans
+                                    # borne), puis l'original seul se faisait entendre une minute (2026-10-08)
 VO_GLUE_CONTINUATIONS = True        # coller les continuations de phrase (même locuteur, segment
                                     # précédent sans ponctuation finale) juste après la 1re moitié,
                                     # même si le silence original > VO_MAX_BRIDGE_GAP_MS et en
@@ -4990,6 +4995,7 @@ def mix_audio_voiceover(segments: list[DubSegment], background_path: str,
 
     bridged = 0
     glued = 0
+    capped = 0
     for i in range(1, len(active_tts)):
         seg, tts_start, tts_dur = active_tts[i]
         prev_seg, prev_start, prev_dur = active_tts[i - 1]
@@ -5016,6 +5022,12 @@ def mix_audio_voiceover(segments: list[DubSegment], background_path: str,
         # au milieu de la phrase (bug « longues pauses qui coupent la phrase »).
         if VO_GLUE_CONTINUATIONS and not getattr(seg, "is_sentence_start", True):
             new_start = int(prev_tts_end + GAP_BETWEEN_CLIPS_MS)
+            # … mais jamais plus de VO_MAX_AHEAD_MS avant le début original du
+            # segment : l'avance ne s'accumule pas de clause en clause.
+            floor = int(seg.start * 1000) - VO_MAX_AHEAD_MS
+            if new_start < floor:
+                new_start = floor
+                capped += 1
             if new_start < tts_start - 50:        # ne bouger que si ça rapproche vraiment
                 seg._tts_place_ms = new_start
                 active_tts[i] = [seg, new_start, tts_dur]
@@ -5052,6 +5064,8 @@ def mix_audio_voiceover(segments: list[DubSegment], background_path: str,
             parts.append(f"{glued} continuation(s) collée(s)")
         if bridged:
             parts.append(f"{bridged} segment(s) rapproché(s)")
+        if capped:
+            parts.append(f"{capped} retenu(s) à {VO_MAX_AHEAD_MS / 1000:.0f} s d'avance au plus")
         print(f"   🔗 {', '.join(parts)} (continuité intra-phrase)")
 
     # Anti-troncature : décaler les clips qui débordent au lieu de tronquer.
