@@ -868,6 +868,39 @@ Réponds UNIQUEMENT en JSON strict (sans markdown) :
 # PASSE 3 : TRADUCTION OPTIONNELLE
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_NUMBERED_LINE_RE = re.compile(r'\[(\d+)\]\s*(.*)')
+# Fin d'une réplique : ligne vide ou séparateur (« === », « --- », bloc de code).
+_END_OF_ITEM_RE = re.compile(r'^(?:===|---|```)')
+
+
+def _parse_numbered_lines(text: str) -> dict:
+    """Sortie « [N] texte » du LLM → { N : texte }.
+
+    Une ligne sans numéro qui suit une réplique en est la suite : les modèles
+    locaux coupent parfois une longue traduction sur deux lignes (vu sur
+    gemma4:26b-a4b, bench 2026-10-17), et seule la première moitié était
+    gardée, sans avertissement. Une ligne vide ou un séparateur termine la
+    réplique ; ce qui précède le premier [N] (préambule) est ignoré."""
+    parts = {}
+    current = None
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        m = _NUMBERED_LINE_RE.match(line)
+        if m:
+            current = int(m.group(1))
+            parts[current] = [m.group(2).strip()]
+        elif not line or _END_OF_ITEM_RE.match(line):
+            current = None
+        elif current is not None:
+            parts[current].append(line)
+    result = {}
+    for idx, pieces in parts.items():
+        txt = re.sub(r'^[A-Z]{2}:\s*', '', " ".join(p for p in pieces if p)).strip()
+        if txt:
+            result[idx] = txt
+    return result
+
+
 def translate_clips(clips: list[ClipSelection], client,
                     source_lang: str, target_lang: str,
                     context: str = "") -> list[ClipSelection]:
@@ -915,13 +948,9 @@ Réponds UNIQUEMENT avec les traductions, une par ligne, format :
 
         # Parser les traductions — ne pas écraser les traductions existantes
         seg_by_idx = {s.index: s for s in clip.segments}
-        for line in resp.content[0].text.strip().split("\n"):
-            m = re.match(r'\[(\d+)\]\s*(.*)', line.strip())
-            if m:
-                idx, txt = int(m.group(1)), m.group(2).strip()
-                txt = re.sub(r'^[A-Z]{2}:\s*', '', txt).strip()
-                if txt and idx in seg_by_idx and not seg_by_idx[idx].text_tgt:
-                    seg_by_idx[idx].text_tgt = txt
+        for idx, txt in _parse_numbered_lines(resp.content[0].text).items():
+            if idx in seg_by_idx and not seg_by_idx[idx].text_tgt:
+                seg_by_idx[idx].text_tgt = txt
 
         done = sum(1 for s in clip.segments if s.text_tgt or not s.text.strip())
         print(f"   ✅ Clip {clip.clip_index} : {done}/{len(clip.segments)} traduits")

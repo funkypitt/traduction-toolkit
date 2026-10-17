@@ -356,6 +356,39 @@ SUBMIT_TEXTS_TOOL = {
 }
 
 
+_NUMBERED_LINE_RE = re.compile(r'\[(\d+)\]\s*(.*)')
+# Fin d'une réplique : ligne vide ou séparateur (« === », « --- », bloc de code).
+_END_OF_ITEM_RE = re.compile(r'^(?:===|---|```)')
+
+
+def _parse_numbered_lines(text: str) -> dict:
+    """Sortie « [N] texte » d'un modèle local → { N : texte }.
+
+    Une ligne sans numéro qui suit une réplique en est la suite : les modèles
+    locaux coupent parfois une longue traduction sur deux lignes (vu sur
+    gemma4:26b-a4b, bench 2026-10-17), et seule la première moitié était
+    gardée, sans avertissement. Une ligne vide ou un séparateur termine la
+    réplique ; ce qui précède le premier [N] (préambule) est ignoré."""
+    parts = {}
+    current = None
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        m = _NUMBERED_LINE_RE.match(line)
+        if m:
+            current = int(m.group(1))
+            parts[current] = [m.group(2).strip()]
+        elif not line or _END_OF_ITEM_RE.match(line):
+            current = None
+        elif current is not None:
+            parts[current].append(line)
+    result = {}
+    for idx, pieces in parts.items():
+        txt = _strip_claude_artifacts(" ".join(p for p in pieces if p))
+        if txt:
+            result[idx] = txt
+    return result
+
+
 def _claude_submit_texts(client, user_prompt: str,
                          system: str = "",
                          max_tokens: int = CLAUDE_MAX_TOKENS) -> dict[int, str]:
@@ -400,16 +433,8 @@ def _claude_submit_texts(client, user_prompt: str,
 
     if is_local:
         # Fallback Ollama : parsing texte libre
-        result: dict[int, str] = {}
         text = resp.content[0].text if resp.content else ""
-        for line in text.strip().split("\n"):
-            m = re.match(r'\[(\d+)\]\s*(.*)', line.strip())
-            if m:
-                idx, txt = int(m.group(1)), m.group(2).strip()
-                txt = _strip_claude_artifacts(txt)
-                if txt:
-                    result[idx] = txt
-        return result
+        return _parse_numbered_lines(text)
 
     # API Claude : extraire le bloc tool_use
     for block in resp.content:

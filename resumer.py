@@ -629,17 +629,45 @@ RÈGLES :
 FORMAT : [numéro] texte en {tgt_name} (un par ligne, rien d'autre)"""
 
 
+_NUMBERED_LINE_RE = re.compile(r'\[(\d+)\]\s*(.*)')
+# Fin d'une réplique : ligne vide ou séparateur (« === », « --- », bloc de code).
+_END_OF_ITEM_RE = re.compile(r'^(?:===|---|```)')
+
+
+def _parse_numbered_lines(text: str) -> dict:
+    """Sortie « [N] texte » du LLM → { N : texte }.
+
+    Une ligne sans numéro qui suit une réplique en est la suite : les modèles
+    locaux coupent parfois une longue traduction sur deux lignes (vu sur
+    gemma4:26b-a4b, bench 2026-10-17), et seule la première moitié était
+    gardée, sans avertissement. Une ligne vide ou un séparateur termine la
+    réplique ; ce qui précède le premier [N] (préambule) est ignoré."""
+    parts = {}
+    current = None
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        m = _NUMBERED_LINE_RE.match(line)
+        if m:
+            current = int(m.group(1))
+            parts[current] = [m.group(2).strip()]
+        elif not line or _END_OF_ITEM_RE.match(line):
+            current = None
+        elif current is not None:
+            parts[current].append(line)
+    result = {}
+    for idx, pieces in parts.items():
+        txt = re.sub(r'^[A-Z]{2}:\s*', '', " ".join(p for p in pieces if p)).strip()
+        if txt:
+            result[idx] = txt
+    return result
+
+
 def _parse_translation(text: str, segments: list[Segment], s: int, e: int):
     """Parse la réponse de traduction Claude."""
-    for line in text.strip().split("\n"):
-        m = re.match(r'\[(\d+)\]\s*(.*)', line.strip())
-        if m:
-            idx, txt = int(m.group(1)), m.group(2).strip()
-            txt = re.sub(r'^[A-Z]{2}:\s*', '', txt).strip()
-            if txt:
-                for seg in segments[s:e]:
-                    if seg.index == idx:
-                        seg.text_tgt = txt; break
+    for idx, txt in _parse_numbered_lines(text).items():
+        for seg in segments[s:e]:
+            if seg.index == idx:
+                seg.text_tgt = txt; break
 
 
 def _retry_translation(segments: list[Segment], s: int, e: int,
