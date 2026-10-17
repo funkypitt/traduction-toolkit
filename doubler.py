@@ -1476,6 +1476,138 @@ Réponds UNIQUEMENT en JSON, sans markdown."""
     return data
 
 
+def _traduire_plage(segments, s, e, system, client, src_lang, tgt_lang, tgt_cps):
+    """Traduit segments[s:e] en un appel (contexte bilingue avant, contexte
+    source après, cible de longueur par segment), puis relance les manquants."""
+    parts = []
+
+    # Contexte arrière
+    cb = max(0, s - CHUNK_OVERLAP)
+    if cb < s:
+        parts.append("=== CONTEXTE PRÉCÉDENT (NE PAS retraduire) ===")
+        for seg in segments[cb:s]:
+            if seg.text_tgt:
+                parts += [f"[{seg.index}] {src_lang.upper()}: {seg.text}",
+                          f"[{seg.index}] {tgt_lang.upper()}: {seg.text_tgt}"]
+        parts.append("")
+
+    # À traduire — cible et min de longueur calculés depuis la durée réelle
+    parts.append("=== À TRADUIRE ===")
+    for seg in segments[s:e]:
+        target_chars = max(int(seg.duration * tgt_cps), 8)
+        min_chars = max(int(target_chars * TRANSLATION_LEN_MIN_RATIO), 5)
+        parts.append(
+            f"[{seg.index}] ({seg.speaker}, durée {seg.duration:.1f}s, "
+            f"cible ≈{target_chars} car., min {min_chars}) {seg.text}"
+        )
+
+    # Contexte avant
+    cf = min(len(segments), e + CHUNK_OVERLAP)
+    if e < cf:
+        parts.append("\n=== CONTEXTE SUIVANT (NE PAS traduire) ===")
+        parts += [f"[{seg.index}] {seg.text}" for seg in segments[e:cf]]
+
+    translations = _claude_submit_texts(client, "\n".join(parts), system=system)
+    _apply_translations(translations, segments, s, e)
+
+    done = sum(1 for seg in segments[s:e] if seg.text_tgt)
+    if done < e - s:
+        print(f"   ⚠️  {done}/{e-s} traduits — relance...")
+        _retry_missing(segments, s, e, system, client, src_lang, tgt_lang)
+
+
+# Détection d'un décalage de numérotation (bench 2026-10-17) : sur un long
+# segment WhisperX sans ponctuation, un modèle local étale parfois sa traduction
+# sur plusieurs numéros ; chaque numéro suivant porte alors la traduction d'un
+# segment antérieur et les derniers ne sont jamais traduits, sans qu'aucun
+# numéro ne manque. Indice mesurable : sur 6 segments consécutifs, la longueur
+# de la traduction colle nettement mieux à la source d'un segment antérieur
+# (décalage 1 à 8) qu'à la sienne. Seuils calés sur 86 chunks du bench :
+# aucune fausse alerte, tous les décalages vus détectés.
+DECALAGE_FENETRE = 6
+DECALAGE_MAX = 8
+DECALAGE_ECART_MIN = 0.35   # écart log moyen minimal au décalage 0
+DECALAGE_GAIN = 0.45        # un décalage doit ramener l'écart sous 45 %
+
+
+def _decalage_suspect(segments) -> list:
+    """Index des segments dont la traduction semble décalée (liste vide sinon)."""
+    p = [(seg.index, len(seg.text), len(seg.text_tgt)) for seg in segments
+         if seg.text.strip() and seg.text_tgt and seg.text_tgt.strip()]
+    if len(p) < DECALAGE_FENETRE + 4:
+        return []
+    # Rapport de longueur propre à la paire de langues (FR ≈ +10 % sur EN, etc.)
+    rapports = sorted(math.log(t / s) for _, s, t in p)
+    med = rapports[len(rapports) // 2]
+
+    def ecart(a, k):
+        return sum(abs(math.log(p[j][2] / p[j - k][1]) - med)
+                   for j in range(a, a + DECALAGE_FENETRE)) / DECALAGE_FENETRE
+
+    suspects = set()
+    for a in range(1, len(p) - DECALAGE_FENETRE + 1):
+        e0 = ecart(a, 0)
+        # En début de chunk, seuls les décalages qui restent dans le chunk comptent
+        decalages = range(1, min(DECALAGE_MAX, a) + 1)
+        if e0 > DECALAGE_ECART_MIN and min(ecart(a, k) for k in decalages) < DECALAGE_GAIN * e0:
+            suspects.update(p[j][0] for j in range(a, a + DECALAGE_FENETRE))
+    return sorted(suspects)
+
+
+DECALAGE_GROUPE = 5   # 2e essai : la zone suspecte par groupes de 5 segments
+
+
+def _corriger_decalage(segments, s, e, system, client, src_lang, tgt_lang, tgt_cps):
+    """Retraduit un chunk décalé : en deux moitiés, puis, si un décalage reste,
+    la zone suspecte par petits groupes (peu de place pour dériver). Garde la
+    version la moins suspecte et nomme les segments encore douteux."""
+    chunk = segments[s:e]
+
+    def instantane():
+        return {seg.index: seg.text_tgt for seg in chunk}
+
+    def restaurer(etat):
+        for seg in chunk:
+            seg.text_tgt = etat[seg.index]
+
+    def retraduire(plages):
+        for a, b in plages:
+            for seg in segments[a:b]:
+                seg.text_tgt = ""
+            _traduire_plage(segments, a, b, system, client, src_lang, tgt_lang, tgt_cps)
+
+    suspects = _decalage_suspect(chunk)
+    print(f"   ⚠️  Décalage suspecté sur [{suspects[0]}]–[{suspects[-1]}] "
+          f"— chunk retraduit en deux moitiés...")
+    meilleur, meilleurs_suspects = instantane(), suspects
+
+    m = (s + e) // 2
+    retraduire([(s, m), (m, e)])
+    suspects = _decalage_suspect(chunk)
+    if len(suspects) < len(meilleurs_suspects):
+        meilleur, meilleurs_suspects = instantane(), suspects
+
+    if suspects:
+        # Zone suspecte (avec marge : le décalage commence avant la 1re fenêtre
+        # repérée) retraduite par groupes, chacun avec le contexte déjà traduit.
+        pos = {seg.index: i for i, seg in enumerate(segments)}
+        a = max(s, pos[suspects[0]] - 3)
+        b = min(e, pos[suspects[-1]] + 3)
+        print(f"   ⚠️  Décalage encore suspecté — [{segments[a].index}]–[{segments[b - 1].index}] "
+              f"retraduits par groupes de {DECALAGE_GROUPE}...")
+        retraduire([(i, min(i + DECALAGE_GROUPE, b)) for i in range(a, b, DECALAGE_GROUPE)])
+        suspects = _decalage_suspect(chunk)
+        if len(suspects) < len(meilleurs_suspects):
+            meilleur, meilleurs_suspects = instantane(), suspects
+
+    restaurer(meilleur)
+    if meilleurs_suspects:
+        print(f"   ⚠️  Décalage toujours suspecté sur [{meilleurs_suspects[0]}]–[{meilleurs_suspects[-1]}] "
+              f"— à vérifier : la traduction peut appartenir à un segment voisin")
+    else:
+        print(f"   ✅ Décalage corrigé")
+
+
 def translate_for_dubbing(segments, analysis, client, src_lang, tgt_lang, context="",
                           sauvegarde=None):
     """
@@ -1568,41 +1700,13 @@ original si chant/prière). Pas de commentaire, pas de préfixe."""
             print(f"   📦 Chunk {ci+1}/{n_chunks} — déjà traduit"); continue
 
         print(f"   📦 Chunk {ci+1}/{n_chunks} (seg {s+1}–{e})...")
-        parts = []
+        _traduire_plage(segments, s, e, system, client, src_lang, tgt_lang, tgt_cps)
 
-        # Contexte arrière
-        cb = max(0, s - CHUNK_OVERLAP)
-        if cb < s:
-            parts.append("=== CONTEXTE PRÉCÉDENT (NE PAS retraduire) ===")
-            for seg in segments[cb:s]:
-                if seg.text_tgt:
-                    parts += [f"[{seg.index}] {src_lang.upper()}: {seg.text}",
-                              f"[{seg.index}] {tgt_lang.upper()}: {seg.text_tgt}"]
-            parts.append("")
-
-        # À traduire — cible et min de longueur calculés depuis la durée réelle
-        parts.append("=== À TRADUIRE ===")
-        for seg in segments[s:e]:
-            target_chars = max(int(seg.duration * tgt_cps), 8)
-            min_chars = max(int(target_chars * TRANSLATION_LEN_MIN_RATIO), 5)
-            parts.append(
-                f"[{seg.index}] ({seg.speaker}, durée {seg.duration:.1f}s, "
-                f"cible ≈{target_chars} car., min {min_chars}) {seg.text}"
-            )
-
-        # Contexte avant
-        cf = min(len(segments), e + CHUNK_OVERLAP)
-        if e < cf:
-            parts.append("\n=== CONTEXTE SUIVANT (NE PAS traduire) ===")
-            parts += [f"[{seg.index}] {seg.text}" for seg in segments[e:cf]]
-
-        translations = _claude_submit_texts(client, "\n".join(parts), system=system)
-        _apply_translations(translations, segments, s, e)
-
-        done = sum(1 for seg in segments[s:e] if seg.text_tgt)
-        if done < e - s:
-            print(f"   ⚠️  {done}/{e-s} traduits — relance...")
-            _retry_missing(segments, s, e, system, client, src_lang, tgt_lang)
+        # Décalage de numérotation : la traduction de [N] porte le texte d'un
+        # segment antérieur, sans qu'aucun numéro ne manque. On retraduit le
+        # chunk en deux moitiés et on garde la version la moins suspecte.
+        if _decalage_suspect(segments[s:e]):
+            _corriger_decalage(segments, s, e, system, client, src_lang, tgt_lang, tgt_cps)
 
         print(f"   ✅ {sum(1 for seg in segments[s:e] if seg.text_tgt)}/{e-s}")
         if sauvegarde:
