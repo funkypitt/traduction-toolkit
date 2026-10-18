@@ -109,6 +109,12 @@ CLAUDE_MAX_TOKENS = 8192
 OLLAMA_URL = "http://localhost:11434"
 OLLAMA_MODEL = "gemma4:31b"        # cf. bench 2026-06-22 : meilleur FR oral (traduction)
 OLLAMA_NUM_PREDICT = 16384             # marge large (tokens réflexion Qwen3 inclus)
+# Fenêtre de contexte demandée à Ollama. Sans elle, Ollama prend 32K et
+# gemma4:31b déborde de 11–15 % sur le CPU d'une carte de 24 Go ; à 16K il
+# tient entier sur le GPU et les passes texte d'un entretien d'une heure
+# passent de 2905 s à 1936 s (bench 2026-10-18). Les passes travaillent par
+# fenêtres de taille fixe : plus gros appel mesuré 7K tokens + 2,4K en sortie.
+OLLAMA_NUM_CTX = 16384
 
 # Doublage audio
 SAMPLE_RATE = 44100
@@ -260,12 +266,16 @@ class _OllamaClient:
         if system:
             msgs.append({"role": "system", "content": system})
         msgs.extend(kwargs.get("messages", []))
+        # Un prompt qui ne tiendrait pas serait tronqué en silence par Ollama :
+        # on agrandit alors la fenêtre (≈ 3 caractères par token + 4K de réponse).
+        besoin = sum(len(m["content"]) for m in msgs) // 3 + 4096
+        num_ctx = max(OLLAMA_NUM_CTX, -(-besoin // 4096) * 4096)
         payload = json.dumps({
             "model": self.model,
             "messages": msgs,
             "stream": False,
             "think": False,            # désactive la réflexion (raisonneurs type qwen3.6/qwen3)
-            "options": {"num_predict": OLLAMA_NUM_PREDICT},
+            "options": {"num_predict": OLLAMA_NUM_PREDICT, "num_ctx": num_ctx},
         }).encode()
         req = urllib.request.Request(
             f"{self.base_url}/api/chat",
