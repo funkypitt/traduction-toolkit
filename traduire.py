@@ -656,6 +656,30 @@ class ContentAnalysis:
     tone: str = ""
     domain: str = ""
 
+    def __post_init__(self):
+        self.glossary = normaliser_glossaire(self.glossary)
+
+def normaliser_glossaire(glossaire: dict) -> dict:
+    """Un seul équivalent par terme du glossaire.
+
+    Le modèle d'analyse propose parfois « influence / incidence » ou
+    « mesures (sanitaires) » : la vérification du glossaire ne retrouve jamais
+    une telle chaîne dans la traduction, demande une « correction » qui
+    recopie l'alternative, et le nettoyage des artefacts l'ampute ensuite
+    (« l'influence / incidence de la Russie » → « l'influence Russie »,
+    2026-10-21). On garde donc le premier équivalent, sans glose."""
+    propre = {}
+    for src, tgt in (glossaire or {}).items():
+        if not isinstance(tgt, str):
+            continue
+        if not re.fullmatch(r"\S{1,4}/\S{1,4}", tgt):          # km/h, et/ou
+            tgt = re.split(r"\s*[/|]\s*|\s+ou\s+", tgt, maxsplit=1)[0]
+        tgt = re.sub(r"\s*\([^)]*\)", "", tgt)
+        tgt = re.sub(r"\s{2,}", " ", tgt).strip(" ,;")
+        if src and tgt:
+            propre[src] = tgt
+    return propre
+
 
 def _fmt(sec: float) -> str:
     h, r = divmod(sec, 3600)
@@ -1555,6 +1579,7 @@ surtout pour l'orthographe des noms propres et le glossaire) :
 Analyse cette transcription en {src_name} et fournis en JSON strict :
 - "summary": résumé 3-5 phrases (en {tgt_name})
 - "glossary": {{"terme_{source_lang}": "traduction_{target_lang}"}} pour termes techniques, noms, expressions
+  (UN SEUL équivalent par terme : jamais « X / Y », jamais de parenthèses)
 - "speakers_description": description brève des locuteurs (en {tgt_name})
 - "tone": registre (formel/conversationnel/technique/etc.)
 - "domain": domaine principal
@@ -1876,6 +1901,38 @@ _ARTIFACT_SLASH_RE = re.compile(
 # Glose : parenthèses contenant 3+ lettres minuscules sans majuscule ni chiffre
 # (les acronymes type OFSP/BAG/SARS-CoV-2 contiennent au moins une majuscule
 # et sont donc préservés).
+# Mots qui ne peuvent pas appartenir à l'alternative de droite : ils ouvrent
+# la suite de la phrase (« influence / incidence DE LA Russie »). Sans cette
+# borne, la regex avalait jusqu'à trois mots après la barre et amputait la
+# phrase (« l'influence Russie », 2026-10-21).
+_SLASH_STOP = {"de", "du", "des", "d'", "à", "au", "aux", "sur", "dans", "pour",
+               "par", "en", "et", "ou", "que", "qui", "avec", "sans", "chez",
+               "vers", "contre", "où", "dont", "mais", "ni", "car", "of", "to",
+               "on", "in", "and", "or", "for", "with", "that", "which"}
+
+
+_SLASH_ARTICLES = {"le", "la", "les", "l'", "l’", "un", "une", "des", "the", "a", "an"}
+
+
+def _slash_repl(m: re.Match) -> str:
+    """« X / Y » → « X », en rendant à la phrase ce qui suit l'alternative.
+
+    L'alternative de droite est prise pour UN mot (deux s'il commence par un
+    article : « les États-Unis ») ; tout mot d'enchaînement (préposition,
+    conjonction) la termine aussitôt. Le reste appartient à la phrase."""
+    droite = m.group(2).split()
+    n = 0
+    for mot in droite:
+        base = mot.lower()
+        if base in _SLASH_STOP or base.startswith("d'") or base.startswith("d’"):
+            break
+        n += 1
+        if not (n == 1 and base in _SLASH_ARTICLES):
+            break
+    reste = " ".join(droite[n:])
+    return f"{m.group(1)} {reste}" if reste else m.group(1)
+
+
 _ARTIFACT_PAREN_RE = re.compile(r'\s*\(([^\W\d_]{2,}(?:[ \-][^\W\d_]+)*)\)\s*', re.UNICODE)
 
 
@@ -1902,7 +1959,7 @@ def _clean_translation_artifacts(segments: list[Segment]) -> list[Segment]:
         if not seg.text_tgt:
             continue
         original = seg.text_tgt
-        new = _ARTIFACT_SLASH_RE.sub(lambda m: m.group(1), original)
+        new = _ARTIFACT_SLASH_RE.sub(_slash_repl, original)
         # Pour les parenthèses : on enlève les parenthèses mais on garde le
         # contenu (ainsi « (sanitaires) » devient « sanitaires », évitant la
         # perte d'info). Si la glose est un doublon contigu (« mot (mot) »),

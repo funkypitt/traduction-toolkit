@@ -1051,6 +1051,7 @@ def analyze_content(segments, client, src_lang, tgt_lang, context=""):
 Analyse cette transcription et fournis en JSON strict :
 - "summary": résumé 3-5 phrases (en {tgt_n})
 - "glossary": {{"terme_{src_lang}": "traduction_{tgt_lang}"}} pour termes techniques/noms/expressions
+  (UN SEUL équivalent par terme : jamais « X / Y », jamais de parenthèses)
 - "speakers_description": description de chaque locuteur identifié (voix, rôle, registre)
 - "tone": registre global
 - "domain": domaine principal
@@ -1074,8 +1075,30 @@ Réponds UNIQUEMENT en JSON, sans markdown."""
         except: data = {}
 
     print(f"   📋 {data.get('summary', '')[:120]}...")
-    print(f"   📖 {len(data.get('glossary', {}))} termes | 🎭 {data.get('tone', '?')}")
+    data["glossary"] = normaliser_glossaire(data.get("glossary", {}))
+    print(f"   📖 {len(data['glossary'])} termes | 🎭 {data.get('tone', '?')}")
     return data
+
+def normaliser_glossaire(glossaire: dict) -> dict:
+    """Un seul équivalent par terme du glossaire.
+
+    Le modèle d'analyse propose parfois « influence / incidence » ou
+    « mesures (sanitaires) » : la vérification du glossaire ne retrouve jamais
+    une telle chaîne dans la traduction, demande une « correction » qui
+    recopie l'alternative, et le nettoyage des artefacts l'ampute ensuite
+    (« l'influence / incidence de la Russie » → « l'influence Russie »,
+    2026-10-21). On garde donc le premier équivalent, sans glose."""
+    propre = {}
+    for src, tgt in (glossaire or {}).items():
+        if not isinstance(tgt, str):
+            continue
+        if not re.fullmatch(r"\S{1,4}/\S{1,4}", tgt):          # km/h, et/ou
+            tgt = re.split(r"\s*[/|]\s*|\s+ou\s+", tgt, maxsplit=1)[0]
+        tgt = re.sub(r"\s*\([^)]*\)", "", tgt)
+        tgt = re.sub(r"\s{2,}", " ", tgt).strip(" ,;")
+        if src and tgt:
+            propre[src] = tgt
+    return propre
 
 
 def translate_segments(segments, analysis, client, src_lang, tgt_lang, context=""):
@@ -2475,6 +2498,7 @@ def process_one_file(input_path: str, args, claude_client, tts_backend=None,
         if os.path.exists(ana_json):
             with open(ana_json) as f:
                 analysis = json.load(f)
+            analysis["glossary"] = normaliser_glossaire(analysis.get("glossary", {}))
         else:
             analysis = {}
 
