@@ -85,7 +85,7 @@ CODECS_AUDIO_NAVIGATEUR = {"aac", "mp3", "opus", "vorbis", "flac"}
 # curseur dérive par rapport au texte.
 LECTURE_DIRECTE_AUDIO = {".m4a", ".ogg", ".oga", ".opus", ".wav", ".flac"}
 
-LANGUES = [("", "Détection automatique"), ("fr", "Français"), ("en", "Anglais"),
+LANGUES = [("", "Langue reconnue automatiquement"), ("fr", "Français"), ("en", "Anglais"),
            ("de", "Allemand"), ("es", "Espagnol"), ("it", "Italien"),
            ("pt", "Portugais"), ("nl", "Néerlandais"), ("ru", "Russe"),
            ("pl", "Polonais"), ("ja", "Japonais"), ("zh", "Chinois")]
@@ -249,8 +249,67 @@ def poser_les_bords(jetons: list, duree: float) -> tuple:
     return jetons, decalage
 
 
-def tache_transcrire(dossier: str, langue: str):
-    """Point d'entrée du sous-processus de transcription."""
+# Code de sortie du sous-processus quand la langue choisie à la main n'est
+# clairement pas celle de l'enregistrement : la page pose la question.
+SORTIE_QUESTION = 3
+
+
+def transcrire(wav: Path, langue: str, verifier: bool, dossier: Path):
+    """WhisperX comme transcribe_whisperx de resumer.py, avec la langue
+    cherchée d'abord sur plusieurs passages (langue_parlee.py) puis donnée à
+    Whisper pour tout le fichier. Retourne (segments, langue, entendue).
+
+    Une langue choisie à la main est vérifiée par la même écoute : si
+    l'enregistrement en parle clairement une autre, la question est écrite
+    dans question.json et le processus s'arrête avant de transcrire."""
+    import resumer
+    import langue_parlee as LP
+    resumer.acquire_gpu_lock()
+    resumer.free_gpu_for_task(min_free_mib=6000, timeout=60)
+    import whisperx, torch, gc
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    calcul = resumer.WHISPER_COMPUTE_TYPE if device == "cuda" else "int8"
+    t0 = time.time()
+    modele = whisperx.load_model(resumer.WHISPER_MODEL, device,
+                                 compute_type=calcul, language=None)
+    audio = whisperx.load_audio(str(wav))
+
+    print("🌐 Écoute de la langue parlée…")
+    entendue = LP.detecter(modele.model, audio)
+    if entendue:
+        print(f"🌐 Langue entendue : {LP.nom(entendue.langue)} "
+              f"({entendue.confiance:.0%}, {entendue.passages} passages)")
+    proposee = LP.suggerer(langue, entendue) if verifier else None
+    if proposee:
+        ecrire_json(dossier / "question.json",
+                    {"choisie": langue, "entendue": entendue.en_dict()})
+        print(f"❓ Langue entendue : {LP.nom(proposee)}. "
+              f"Langue choisie : {LP.nom(langue)}.")
+        sys.exit(SORTIE_QUESTION)
+    choisie = langue or (entendue.langue if entendue else None)
+
+    print(f"🎙️  Transcription ({LP.nom(choisie) if choisie else 'langue inconnue'})…")
+    result = modele.transcribe(audio, batch_size=resumer.WHISPER_BATCH_SIZE,
+                               language=choisie)
+    choisie = result.get("language", choisie or "en")
+    del modele; gc.collect()
+    if device == "cuda": torch.cuda.empty_cache()
+    print(f"🎙️  Transcription : {time.time() - t0:.0f} s. Alignement mot par mot…")
+    model_a, metadata = whisperx.load_align_model(language_code=choisie, device=device)
+    result = whisperx.align(result["segments"], model_a, metadata, audio, device,
+                            return_char_alignments=False)
+    del model_a; gc.collect()
+    if device == "cuda": torch.cuda.empty_cache()
+    segments = [resumer.Segment(index=i + 1, start=x["start"], end=x["end"],
+                                text=x["text"].strip(), words=x.get("words", []))
+                for i, x in enumerate(result["segments"])]
+    return segments, choisie, entendue
+
+
+def tache_transcrire(dossier: str, langue: str, confirmee: bool = False):
+    """Point d'entrée du sous-processus de transcription. `confirmee` : la
+    langue a déjà été confirmée pour ce fichier, elle n'est pas revérifiée."""
     dossier = Path(dossier)
     projet = lire_json(dossier / "projet.json")
     if not projet:
@@ -275,7 +334,7 @@ def tache_transcrire(dossier: str, langue: str):
             return
         print("🎙️  Le son est transcrit à la place.")
 
-    from resumer import extract_audio, transcribe_whisperx
+    from resumer import extract_audio
 
     wav = dossier / "audio16k.wav"
     if not wav.exists():
@@ -284,7 +343,8 @@ def tache_transcrire(dossier: str, langue: str):
         os.replace(tmp, wav)
 
     try:
-        segments, detectee = transcribe_whisperx(str(wav), langue or None)
+        segments, detectee, entendue = transcrire(wav, langue, bool(langue) and not confirmee,
+                                                  dossier)
     except ValueError as ex:
         # WhisperX n'a pas de modèle d'alignement pour toutes les langues, et
         # la détection automatique se trompe parfois (musique en ouverture).
@@ -304,7 +364,9 @@ def tache_transcrire(dossier: str, langue: str):
 
     jetons = construire_jetons(segments, projet.get("duree") or 0.0)
     ecrire_json(dossier / "transcription.json",
-                {"version": VERSION_JETONS, "langue": detectee, "jetons": jetons})
+                {"version": VERSION_JETONS, "langue": detectee, "choisie": langue,
+                 "entendue": entendue.en_dict() if entendue else None,
+                 "jetons": jetons})
     n_mots = sum(1 for j in jetons if j[0] is not None)
     print(f"   ✅ Texte prêt : {n_mots} mots")
 
@@ -1378,7 +1440,7 @@ def finaliser_le_son(tache: dict, sortie: Path):
 TRANSCRIPTIONS = {}     # id projet → {proc, lignes, debut}
 APERCUS = {}            # id projet → "encours" | "erreur"
 TACHES = {}             # id tâche → dict
-JETONS = {}             # id projet → (mtime, jetons, langue, origine, estimé)
+JETONS = {}             # id projet → (mtime, jetons, langue, origine, estimé, entendue, choisie)
 EXISTANTS = {}          # id projet → texte déjà produit trouvé pour ce fichier
 VERROU = threading.Lock()
 
@@ -1411,7 +1473,8 @@ def charger_jetons(dossier: Path, pid: str):
         mtime = chemin.stat().st_mtime
     with VERROU:
         JETONS[pid] = (mtime, data["jetons"], data.get("langue", ""),
-                       data.get("origine", ""), bool(data.get("estime")))
+                       data.get("origine", ""), bool(data.get("estime")),
+                       data.get("entendue"), data.get("choisie", ""))
     return data["jetons"], data.get("langue", "")
 
 
@@ -1421,6 +1484,14 @@ def origine_du_texte(pid: str) -> tuple:
     with VERROU:
         cache = JETONS.get(pid)
     return (cache[3], cache[4]) if cache else ("", False)
+
+
+def langue_entendue(pid: str) -> tuple:
+    """(entendue, choisie) de la transcription chargée : ce que l'écoute a
+    trouvé ({langue, confiance, …} ou None) et la langue choisie à la main."""
+    with VERROU:
+        cache = JETONS.get(pid)
+    return (cache[5], cache[6]) if cache else (None, "")
 
 
 def texte_existant(projet: dict):
@@ -1488,6 +1559,13 @@ def lancer_apercu(dossier: Path, projet: dict):
 
 def lancer_transcription(dossier: Path, projet: dict, langue: str):
     pid = projet["id"]
+    # Une question de langue déjà posée pour ce fichier ne l'est plus : la
+    # réponse est gardée dans projet.json.
+    confirmee = bool(langue) and langue == projet.get("langue_confirmee")
+    try:
+        (dossier / "question.json").unlink()
+    except OSError:
+        pass
     with VERROU:
         t = TRANSCRIPTIONS.get(pid)
         if t and t["proc"].poll() is None:
@@ -1495,7 +1573,8 @@ def lancer_transcription(dossier: Path, projet: dict, langue: str):
         env = dict(os.environ, PYTHONUNBUFFERED="1")
         proc = subprocess.Popen(
             [PYTHON_BIN, str(SCRIPT_DIR / "monter.py"),
-             "--tache-transcrire", str(dossier), "--langue", langue or ""],
+             "--tache-transcrire", str(dossier), "--langue", langue or ""]
+            + (["--langue-confirmee"] if confirmee else []),
             cwd=str(SCRIPT_DIR), env=env, text=True, errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         t = {"proc": proc, "lignes": deque(maxlen=200), "debut": time.time()}
@@ -1525,10 +1604,14 @@ def etat_du_projet(dossier: Path, projet: dict) -> dict:
         e["etat"] = "pret"
         _, e["langue"] = charger_jetons(dossier, pid)
         e["origine"] = origine_du_texte(pid)[0]
+        e["entendue"], e["choisie"] = langue_entendue(pid)
     elif t and t["proc"].poll() is None:
         e["etat"] = "transcription"
         e["depuis"] = round(time.time() - t["debut"])
         e["journal"] = list(t["lignes"])[-1:] if t["lignes"] else []
+    elif (dossier / "question.json").exists():
+        e["etat"] = "question"
+        e["question"] = lire_json(dossier / "question.json")
     elif t:
         e["etat"] = "erreur"
         rates = [l for l in t["lignes"] if l.startswith("❌")]
@@ -1574,7 +1657,8 @@ def creer_blueprint():
     @app.route("/api/config")
     def api_config():
         depart = INPUT_DIR if INPUT_DIR.is_dir() else Path.home()
-        return jsonify({"depart": str(depart), "langues": LANGUES,
+        from langue_parlee import NOMS
+        return jsonify({"depart": str(depart), "langues": LANGUES, "noms": NOMS,
                         "fondu": FONDU_DEFAUT})
 
     @app.route("/api/parcourir")
@@ -1648,9 +1732,13 @@ def creer_blueprint():
             projet["reprise"] = ancien["reprise"]
         elif not (dossier / "transcription.json").exists():
             projet["reprise"] = texte_existant(projet)
+        if ancien.get("langue_confirmee"):
+            projet["langue_confirmee"] = ancien["langue_confirmee"]
         ecrire_json(dossier / "projet.json", projet)
         lancer_apercu(dossier, projet)
-        if not (dossier / "transcription.json").exists():
+        # Une question de langue en attente reste posée : c'est elle qui relance.
+        if not (dossier / "transcription.json").exists() \
+                and not (dossier / "question.json").exists():
             lancer_transcription(dossier, projet, langue)
         return jsonify(etat_du_projet(dossier, projet))
 
@@ -1679,6 +1767,8 @@ def creer_blueprint():
         else:
             projet["reprise"] = None
         langue = (data.get("langue") or "").strip().lower()
+        if data.get("confirmee") and langue:
+            projet["langue_confirmee"] = langue      # réponse à la question de langue
         existant = texte_existant(projet)
         if not langue and existant and existant["genre"] == "doublage":
             langue = existant["langue"]         # la langue de la voix doublée
@@ -1710,7 +1800,9 @@ def creer_blueprint():
             sel["plages"] = plages_depuis_temps(jetons, sel.pop("temps"))
             ecrire_json(dossier / "selection.json", sel)
         origine, estime = origine_du_texte(pid)
+        entendue, choisie = langue_entendue(pid)
         return jsonify({"jetons": jetons, "langue": langue,
+                        "entendue": entendue, "choisie": choisie,
                         "origine": origine, "estime": estime,
                         "plages": sel.get("plages", []),
                         "mode": sel.get("mode", "garder"),
@@ -2007,12 +2099,16 @@ input:focus,select:focus{border-color:var(--accent)}
 #modes{align-items:center}
 #modes span{padding:0 4px 0 12px;font-size:12px;color:var(--muted);white-space:nowrap}
 #origine{max-width:calc(72ch + 96px);margin:0 auto;padding:22px 28px 0 88px;font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--encre2)}
-#origine + #texte{padding-top:18px}
+#origine + #texte,#entendue + #texte{padding-top:18px}
 #origine button{font:inherit;border:none;background:none;padding:0;margin-left:6px;color:#b8530f;text-decoration:underline;cursor:pointer}
 #origine button:hover{color:#8a3d08}
+#entendue{max-width:calc(72ch + 96px);margin:0 auto;padding:14px 28px 0 88px;font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--encre2);display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
+#entendue select,#entendue .btn{background:#fff;color:var(--encre);border-color:#d5cebd;font-size:12px;padding:4px 10px}
+#question .ligne{flex-direction:column;align-items:center}
+#patience #question .btn.fort{background:var(--accent);border-color:var(--accent);color:#1b1205}
 #patience{max-width:560px;margin:16vh auto 0;padding:0 28px;text-align:center;font:17px/1.6 "Iowan Old Style","Palatino Linotype",Georgia,serif;color:var(--encre)}
 #patience .rond{width:34px;height:34px;border-radius:50%;border:3px solid var(--filet);border-top-color:#e0621a;margin:0 auto 22px;animation:tour 1s linear infinite}
-#patience.erreur .rond{display:none}
+#patience.erreur .rond,#patience.question .rond{display:none}
 #patience .fil{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--encre2);margin-top:14px;white-space:pre-wrap;word-break:break-word}
 #patience .ligne{justify-content:center;margin-top:22px}
 #patience select,#patience .btn{background:#fff;color:var(--encre);border-color:#d5cebd}
@@ -2136,8 +2232,19 @@ input:focus,select:focus{border-color:var(--accent)}
           <select id="langue2"></select>
           <button class="btn" id="b-reessayer">Recommencer la transcription</button>
         </div>
+        <div id="question" hidden>
+          <div class="ligne">
+            <button class="btn fort" id="q-entendue"></button>
+            <button class="btn" id="q-choisie"></button>
+          </div>
+        </div>
       </div>
       <div id="origine" hidden><span></span><button id="b-texte"></button></div>
+      <div id="entendue" hidden>
+        <span></span>
+        <select id="langue3" title="Langue parlée"></select>
+        <button class="btn" id="b-autre-langue"></button>
+      </div>
       <div id="texte"></div>
     </div>
   </div>
@@ -2207,12 +2314,24 @@ async function api(url, corps){
 /* ── Accueil ─────────────────────────────────────────────── */
 async function demarrer(){
   CONFIG = await api('/api/config');
-  for (const id of ['langue', 'langue2'])
+  for (const id of ['langue', 'langue2', 'langue3']) {
     $('#'+id).innerHTML = CONFIG.langues.map(l => `<option value="${l[0]}">${l[1]}</option>`).join('');
+    $('#'+id).onchange = nommerLangues;
+  }
+  nommerLangues();
   $('#fondu').value = String(CONFIG.fondu);
   const voulu = new URLSearchParams(location.search).get('ouvrir');
   if (voulu) { $('#chemin').value = voulu; ouvrir(voulu); }
   else recents();
+}
+/* La langue dans laquelle on va transcrire est écrite sur le bouton même qui
+   lance la transcription : un choix resté sur la mauvaise langue se voit. */
+const nomLangue = code => (CONFIG && CONFIG.noms[code]) || code;
+const avecLangue = code => 'langue : ' + (code ? nomLangue(code) : 'reconnue automatiquement');
+function nommerLangues(){
+  $('#b-ouvrir').textContent = 'Ouvrir · ' + avecLangue($('#langue').value);
+  $('#b-reessayer').textContent = 'Recommencer la transcription · ' + avecLangue($('#langue2').value);
+  $('#b-autre-langue').textContent = 'Transcrire à nouveau · ' + avecLangue($('#langue3').value);
 }
 async function recents(){
   const liste = await api('/api/projets');
@@ -2291,7 +2410,7 @@ function installer(p){
   document.title = p.nom + ' — Montage au stabilo';
   $('#titre .n').textContent = p.nom;
   $('#titre .d').textContent = (p.type === 'video' ? 'Vidéo' : 'Enregistrement') + ' · ' + enClair(p.duree);
-  $('#texte').innerHTML = ''; $('#origine').hidden = true;
+  $('#texte').innerHTML = ''; $('#origine').hidden = true; $('#entendue').hidden = true;
   $('#ecran').innerHTML = ''; $('#ecran').className = p.type === 'video' ? '' : 'son';
   $('#format').innerHTML = (p.type === 'video' ? '<option value="mp4">Une vidéo (MP4)</option>' : '')
     + '<option value="mp3">Un son (MP3)</option><option value="m4a">Un son (M4A)</option><option value="wav">Un son (WAV)</option>';
@@ -2331,6 +2450,7 @@ async function suivreProjet(p){
     (p.apercu === 'erreur' ? 'Ce fichier ne peut pas être lu ici. Le texte et le montage restent possibles.'
                            : 'Préparation de la lecture…') + '</div>';
   const pat = $('#patience');
+  $('#question').hidden = p.etat !== 'question';
   if (p.etat === 'pret') {
     pat.hidden = true;
     if (!J.length) await chargerTexte();
@@ -2341,6 +2461,19 @@ async function suivreProjet(p){
       ? 'Reprise du texte ' + (NOMS_TEXTE[p.reprise] || 'déjà fait')
       : 'Transcription en cours' + (p.depuis ? ' depuis ' + enClair(p.depuis) : '')) + '…';
     pat.querySelector('.fil').textContent = (p.journal || []).join('\n').replace(/^\s+/, '');
+  } else if (p.etat === 'question') {
+    // La langue choisie à la main n'est clairement pas celle qu'on entend :
+    // on demande avant de transcrire, la langue entendue en premier.
+    const q = p.question || {}, entendue = (q.entendue || {}).langue || '';
+    pat.hidden = false; pat.className = 'question'; $('#reprise').hidden = true;
+    pat.querySelector('.quoi').textContent =
+      'Langue entendue : ' + nomLangue(entendue) + '. Langue choisie : ' + nomLangue(q.choisie) + '.';
+    pat.querySelector('.fil').textContent = '';
+    $('#q-entendue').textContent = 'Transcrire · langue : ' + nomLangue(entendue);
+    $('#q-entendue').dataset.l = entendue;
+    $('#q-choisie').textContent = 'Transcrire · langue : ' + nomLangue(q.choisie);
+    $('#q-choisie').dataset.l = q.choisie || '';
+    return;
   } else {
     pat.hidden = false; pat.className = 'erreur'; $('#reprise').hidden = false;
     pat.querySelector('.quoi').textContent = 'La transcription a échoué.';
@@ -2371,22 +2504,41 @@ function afficherOrigine(origine){
     bouton = 'Afficher le texte ' + NOMS_TEXTE[P.existant];
     vers = 'existant';
   }
+  if (vers === 'son' && bouton) bouton += ' · ' + avecLangue('');
   o.hidden = !texte;
   o.querySelector('span').textContent = texte;
   b.textContent = bouton; b.dataset.vers = vers;
 }
-$('#b-texte').onclick = async e => {
+/* Après une transcription : la langue entendue, et de quoi transcrire à
+   nouveau dans une autre langue si l'écoute s'est trompée. */
+function afficherEntendue(d){
+  const e = $('#entendue');
+  e.hidden = !!d.origine || !d.langue;
+  if (e.hidden) return;
+  const ent = d.entendue && d.entendue.langue;
+  let t = ent ? 'Langue entendue : ' + nomLangue(ent) + '.' : 'Langue de la transcription : ' + nomLangue(d.langue) + '.';
+  if (ent && d.langue !== ent) t += ' Transcrit en ' + nomLangue(d.langue) + ', la langue choisie.';
+  e.querySelector('span').textContent = t;
+}
+async function relancer(corps, surErreur){
   if (tache) return;
   try {
-    const p = await api('/api/retranscrire/' + P.id, {texte: e.target.dataset.vers});
+    const p = await api('/api/retranscrire/' + P.id, corps);
     finMontage(); clearTimeout(veille);
     P = Object.assign(P, p);
     J = []; sel = new Uint8Array(0); spans = []; histo = []; futur = []; coupes = [];
-    $('#texte').innerHTML = ''; $('#origine').hidden = true;
+    $('#texte').innerHTML = ''; $('#origine').hidden = true; $('#entendue').hidden = true;
     bilan(); boutons();
     suivreProjet(p);
-  } catch(err) { $('#origine span').textContent = err.message; }
-};
+  } catch(err) { surErreur(err.message); }
+}
+$('#b-texte').onclick = e =>
+  relancer({texte: e.target.dataset.vers}, m => { $('#origine span').textContent = m; });
+$('#b-autre-langue').onclick = () =>
+  relancer({langue: $('#langue3').value}, m => { $('#entendue span').textContent = m; });
+for (const id of ['q-entendue', 'q-choisie'])
+  $('#'+id).onclick = e =>
+    relancer({langue: e.target.dataset.l, confirmee: true}, m => { $('#patience .fil').textContent = m; });
 $('#b-reessayer').onclick = async () => {
   try { suivreProjet(await api('/api/retranscrire/' + P.id, {langue: $('#langue2').value})); }
   catch(e) { $('#patience .fil').textContent = e.message; }
@@ -2405,6 +2557,7 @@ async function chargerTexte(){
   J = d.jetons;
   origineTexte = d.origine;
   afficherOrigine(d.origine);
+  afficherEntendue(d);
   sel = new Uint8Array(J.length);
   for (const [a, b] of d.plages)
     for (let i = Math.max(0, a); i <= Math.min(J.length - 1, b); i++) sel[i] = 1;
@@ -2806,12 +2959,13 @@ def main():
     parser.add_argument("--sans-navigateur", action="store_true",
                         help="Ne pas ouvrir le navigateur")
     parser.add_argument("--langue", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--langue-confirmee", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--tache-transcrire", metavar="DOSSIER",
                         help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.tache_transcrire:
-        tache_transcrire(args.tache_transcrire, args.langue)
+        tache_transcrire(args.tache_transcrire, args.langue, args.langue_confirmee)
         return
 
     try:

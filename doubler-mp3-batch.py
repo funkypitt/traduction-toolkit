@@ -563,7 +563,7 @@ QWEN3TTS_BRIDGE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__))
                                        "qwen3tts_bridge.py")
 
 
-def check_dependencies(tts_backend="qwen3tts", local=False):
+def check_dependencies(tts_backend="qwen3tts", local=False, separator="demucs"):
     """Vérifie toutes les dépendances du pipeline."""
     print("🔍 Vérification des dépendances...")
     ok = True
@@ -592,6 +592,14 @@ def check_dependencies(tts_backend="qwen3tts", local=False):
         else:
             print("   qwen3tts    : ❌  → conda create -n qwen3tts python=3.12 && "
                   "conda run -n qwen3tts pip install -U qwen-tts soundfile"); ok = False
+
+    # Séparation voix/fond
+    if separator == "roformer":
+        if _get_audio_separator_bin():
+            print("   roformer    : ✅  (env audio-separator)")
+        else:
+            print("   roformer    : ❌  → conda create -n audio-separator python=3.10 && "
+                  "conda run -n audio-separator pip install -U 'audio-separator[gpu]'"); ok = False
 
     if not local and not os.environ.get("ANTHROPIC_API_KEY"):
         print("   ⚠️  ANTHROPIC_API_KEY non définie"); ok = False
@@ -761,6 +769,10 @@ def diarize_speakers(audio_path: str, segments: list[Segment],
         return segments
 
     t0 = time.time()
+    # En reprise la transcription est sautée, et sa purge avec : un modèle
+    # Ollama encore résident fait OOM pyannote.
+    acquire_gpu_lock()
+    free_gpu_for_task(min_free_mib=6000, timeout=60)
     from whisperx.diarize import DiarizationPipeline
     diarize_model = DiarizationPipeline(token=hf_token, device=device)
 
@@ -842,16 +854,27 @@ def _get_audio_duration(audio_path: str) -> float:
     return 0.0
 
 
-def separate_sources(audio_hq_path: str, work_dir: str) -> str:
+def separate_sources(audio_hq_path: str, work_dir: str,
+                     separator: str = "demucs") -> str:
     """
-    Sépare voix et fond sonore avec Demucs.
+    Sépare voix et fond sonore avec Demucs, ou avec MelBand-RoFormer
+    (`separator="roformer"`, voir _run_roformer_single).
     On ne retourne que le stem vocal (pour les échantillons de clonage).
     """
-    print(f"\n🎛️  Passe 3 — Séparation de sources (Demucs)...")
+    moteur = "MelBand-RoFormer" if separator == "roformer" else "Demucs"
+    print(f"\n🎛️  Passe 3 — Séparation de sources ({moteur})...")
     t0 = time.time()
 
     out_dir = os.path.join(work_dir, "demucs_out")
     os.makedirs(out_dir, exist_ok=True)
+
+    if separator == "roformer":
+        vocals, _no_vocals = _run_roformer_single(audio_hq_path, out_dir)
+        if not vocals:
+            return ""
+        mv = os.path.getsize(vocals) / (1024*1024)
+        print(f"   ✅ vocals.wav ({mv:.1f} Mo) [{time.time()-t0:.0f}s]")
+        return vocals
 
     cmd = [
         sys.executable, "-m", "demucs",
@@ -885,6 +908,74 @@ def separate_sources(audio_hq_path: str, work_dir: str) -> str:
     mv = os.path.getsize(vocals) / (1024*1024)
     print(f"   ✅ vocals.wav ({mv:.1f} Mo) [{time.time()-t0:.0f}s]")
     return vocals
+
+
+# ── Moteur « roformer » : MelBand-RoFormer via audio-separator ─────────────────
+# Modèle « MelBand Roformer | Vocals by Kimberley Jensen »
+# (vocals_mel_band_roformer.ckpt, licence MIT, 913 Mo) : SDR vocals 12,6 dB
+# annoncé par le catalogue d'audio-separator (`audio-separator --list_models`),
+# le meilleur « vocals » sous licence libre du catalogue (Kim FT by unwa 12,4 ;
+# BS-Roformer-Viperx-1296 12,1 ; htdemucs ≈ 8,6 sur le même banc MVSEP).
+# Tourne dans l'env conda `audio-separator` via son CLI, comme Qwen3-TTS dans le
+# sien. Mesuré le 2026-11-02 sur un média synthétique (essais-asr/RESULTATS.md).
+ROFORMER_MODEL = "vocals_mel_band_roformer.ckpt"
+# Pas le /tmp par défaut du CLI (effacé au redémarrage → 913 Mo retéléchargés).
+ROFORMER_MODEL_DIR = os.path.expanduser("~/.cache/audio-separator-models")
+
+
+def _get_audio_separator_bin() -> str:
+    """Retourne le CLI audio-separator de l'env conda 'audio-separator', ou '' si introuvable."""
+    for base in [os.path.expanduser("~/miniconda3"), os.path.expanduser("~/anaconda3"),
+                 "/opt/conda", os.path.expanduser("~/miniforge3")]:
+        exe = os.path.join(base, "envs", "audio-separator", "bin", "audio-separator")
+        if os.path.isfile(exe):
+            return exe
+    try:
+        r = subprocess.run(["conda", "info", "--envs"], capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            if "audio-separator" in line and "/envs/" in line:
+                exe = os.path.join(line.split()[-1].strip(), "bin", "audio-separator")
+                if os.path.isfile(exe):
+                    return exe
+    except Exception:
+        pass
+    return ""
+
+
+def _run_roformer_single(audio_path: str, out_dir: str) -> tuple[str, str]:
+    """Lance audio-separator (MelBand-RoFormer) sur un fichier audio et retourne
+    (vocals, no_vocals), écrits dans <out_dir>/roformer/ — le pendant du
+    <out_dir>/htdemucs/ de Demucs : mêmes noms de fichiers, même 44,1 kHz stéréo.
+    Le checkpoint est téléchargé au premier appel dans ROFORMER_MODEL_DIR, puis
+    réutilisé (le CLI vérifie la présence du fichier, pas de retéléchargement)."""
+    exe = _get_audio_separator_bin()
+    if not exe:
+        print("   ❌ audio-separator introuvable → conda create -n audio-separator python=3.10 && "
+              "conda run -n audio-separator pip install -U 'audio-separator[gpu]'")
+        return "", ""
+    model_dir = os.path.join(out_dir, "roformer")
+    os.makedirs(model_dir, exist_ok=True)
+    cmd = [
+        exe, "-m", ROFORMER_MODEL,
+        "--model_file_dir", ROFORMER_MODEL_DIR,
+        "--output_dir", model_dir,
+        "--output_format", "WAV",
+        # 1.0 = ne touche au niveau que pour éviter l'écrêtage (le défaut 0.9
+        # baisserait les pistes et changerait le niveau du fond sous le doublage).
+        "--normalization", "1.0",
+        "--custom_output_names", json.dumps({"Vocals": "vocals", "Other": "no_vocals"}),
+        audio_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"   ❌ audio-separator erreur :\n{(r.stderr or r.stdout)[-600:]}")
+        return "", ""
+    vocals = os.path.join(model_dir, "vocals.wav")
+    no_vocals = os.path.join(model_dir, "no_vocals.wav")
+    if not (os.path.exists(vocals) and os.path.exists(no_vocals)):
+        print(f"   ❌ pistes introuvables dans {model_dir} : {os.listdir(model_dir)}")
+        return "", ""
+    return vocals, no_vocals
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2443,7 +2534,7 @@ def process_one_file(input_path: str, args, claude_client, tts_backend=None,
     # ── PASSE 1b + 3 : Audio HQ + Demucs ────────────────────────────────
     if not os.path.exists(audio_hq):
         extract_audio_hq(input_path, audio_hq)
-    vocals_path = separate_sources(audio_hq, work_dir)
+    vocals_path = separate_sources(audio_hq, work_dir, separator=args.separator)
 
     # ── PASSE 2 : Diarisation ────────────────────────────────────────────
     if args.speakers == 1:
@@ -2583,6 +2674,10 @@ def main():
                    help="Langue cible (code ISO 639-1, défaut: fr)")
     p.add_argument("--model", choices=["qwen3tts"], default="qwen3tts",
                    help="Backend TTS à utiliser (défaut: qwen3tts)")
+    p.add_argument("--separator", choices=["demucs", "roformer"], default="demucs",
+                   help="Moteur de séparation voix/fond (défaut: demucs). "
+                        "roformer = MelBand-RoFormer via audio-separator (env conda "
+                        "audio-separator), plus lent.")
     p.add_argument("--segments", metavar="JSON",
                    help="Reprendre depuis un fichier segments existant")
     p.add_argument("--speakers", type=int, default=None,
@@ -2657,7 +2752,8 @@ def main():
 
     # ── Vérifications ────────────────────────────────────────────────────
     if not args.skip_checks:
-        check_dependencies(tts_backend=args.model, local=(args.llm == "local"))
+        check_dependencies(tts_backend=args.model, local=(args.llm == "local"),
+                           separator=args.separator)
 
     # ── Backend LLM (API Claude ou Ollama local) ─────────────────────────
     if args.llm == "local":

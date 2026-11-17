@@ -562,6 +562,55 @@ def _get_qwen3tts_python() -> str:
 QWEN3TTS_BRIDGE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                        "qwen3tts_bridge.py")
 
+
+def _get_qwen3asr_python() -> str:
+    """Retourne le chemin du python de l'env conda 'qwen3asr' (--asr qwen3), ou '' si introuvable."""
+    for base in [os.path.expanduser("~/miniconda3"), os.path.expanduser("~/anaconda3"),
+                 "/opt/conda", os.path.expanduser("~/miniforge3")]:
+        py = os.path.join(base, "envs", "qwen3asr", "bin", "python")
+        if os.path.isfile(py):
+            return py
+    try:
+        r = subprocess.run(["conda", "info", "--envs"], capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            if "qwen3asr" in line and "/envs/" in line:
+                py = os.path.join(line.split()[-1].strip(), "bin", "python")
+                if os.path.isfile(py):
+                    return py
+    except Exception:
+        pass
+    return ""
+
+QWEN3ASR_BRIDGE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "qwen3asr_bridge.py")
+
+# LatentSync 1.6 (ByteDance, Apache 2.0) — option --lipsync : les lèvres de la
+# vidéo doublée suivent la voix doublée. Dépôt cloné + checkpoints dans
+# LATENTSYNC_DIR (défaut ~/LatentSync), env conda `latentsync` (python 3.10).
+LATENTSYNC_DIR = os.path.expanduser(os.environ.get("LATENTSYNC_DIR", "~/LatentSync"))
+LATENTSYNC_STEPS = 20          # pas de diffusion (20 = qualité du dépôt, 10 = 2× plus rapide)
+LATENTSYNC_GUIDANCE = 1.5
+LATENTSYNC_SEED = 1247
+
+
+def _get_latentsync_python() -> str:
+    """Retourne le python de l'env conda 'latentsync' (--lipsync), ou '' si introuvable."""
+    for base in [os.path.expanduser("~/miniconda3"), os.path.expanduser("~/anaconda3"),
+                 "/opt/conda", os.path.expanduser("~/miniforge3")]:
+        py = os.path.join(base, "envs", "latentsync", "bin", "python")
+        if os.path.isfile(py):
+            return py
+    try:
+        r = subprocess.run(["conda", "info", "--envs"], capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            if "latentsync" in line and "/envs/" in line:
+                py = os.path.join(line.split()[-1].strip(), "bin", "python")
+                if os.path.isfile(py):
+                    return py
+    except Exception:
+        pass
+    return ""
+
 # Qwen3-TTS (Alibaba Qwen — local, GPU, 10 langues dont FR, Apache 2.0)
 QWEN3TTS_MAX_CHARS = 300
 QWEN3TTS_SPEED_MIN = 0.70
@@ -575,7 +624,7 @@ QWEN3TTS_LANG_MAP = {
 }
 
 
-def check_dependencies(tts_backend: str):
+def check_dependencies(tts_backend: str, separator: str = "demucs", asr: str = "whisperx"):
     """Vérifie toutes les dépendances du pipeline."""
     print("🔍 Vérification des dépendances...")
     ok = True
@@ -614,6 +663,22 @@ def check_dependencies(tts_backend: str):
             print("   elevenlabs  : ❌  → pip install elevenlabs --break-system-packages"); ok = False
         if not os.environ.get("ELEVENLABS_API_KEY"):
             print("   ⚠️  ELEVENLABS_API_KEY non définie"); ok = False
+
+    # Séparation voix/fond
+    if separator == "roformer":
+        if _get_audio_separator_bin():
+            print("   roformer    : ✅  (env audio-separator)")
+        else:
+            print("   roformer    : ❌  → conda create -n audio-separator python=3.10 && "
+                  "conda run -n audio-separator pip install -U 'audio-separator[gpu]'"); ok = False
+
+    # ASR
+    if asr == "qwen3":
+        if _get_qwen3asr_python():
+            print("   qwen3asr    : ✅  (env isolé)")
+        else:
+            print("   qwen3asr    : ❌  → conda create -n qwen3asr python=3.12 && "
+                  "conda run -n qwen3asr pip install -U qwen-asr"); ok = False
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("   ⚠️  ANTHROPIC_API_KEY non définie"); ok = False
@@ -888,6 +953,79 @@ def transcribe_whisperx(audio_path: str, source_lang: str,
     return segments
 
 
+def transcribe_qwen3(audio_path: str, source_lang: str,
+                     hf_token: Optional[str] = None) -> list[DubSegment]:
+    """Transcrit avec Qwen3-ASR-1.7B + horodatage mot à mot par
+    Qwen3-ForcedAligner-0.6B (`--asr qwen3`), via `qwen3asr_bridge.py` lancé
+    dans l'env conda `qwen3asr` (même mécanique que le pont Qwen3-TTS).
+    Renvoie EXACTEMENT la même structure que transcribe_whisperx() :
+    DubSegment(index, start, end, text, words=[{word, start, end}, …]) — la
+    diarisation (assign_word_speakers) et la suite n'y voient aucune
+    différence. `hf_token` est ignoré (les poids sont publics).
+    Limites : l'aligneur couvre 11 langues (zh, en, yue, fr, de, it, ja, ko,
+    pt, ru, es) ; pour une autre langue de l'ASR, les mots arrivent sans
+    horodatage. Essai du 2026-11-02 : essais-asr/RESULTATS.md."""
+    acquire_gpu_lock()
+    free_gpu_for_task(min_free_mib=6000, timeout=60)  # purge un Ollama résident
+    qwen3_py = _get_qwen3asr_python()
+    if not qwen3_py:
+        print("   ❌ env conda 'qwen3asr' introuvable → conda create -n qwen3asr python=3.12 && "
+              "conda run -n qwen3asr pip install -U qwen-asr")
+        sys.exit(1)
+    print(f"\n📝 Passe 1c — Transcription Qwen3-ASR-1.7B + ForcedAligner (env isolé)...")
+    t0 = time.time()
+    proc = subprocess.Popen([qwen3_py, QWEN3ASR_BRIDGE_SCRIPT],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, bufsize=1)
+
+    def _drain():
+        try:
+            for _line in proc.stderr:
+                pass
+        except (ValueError, OSError):
+            pass
+    threading.Thread(target=_drain, daemon=True).start()
+
+    def _call(cmd: dict) -> dict:
+        try:
+            proc.stdin.write(json.dumps(cmd) + "\n"); proc.stdin.flush()
+            line = proc.stdout.readline()
+            if not line:
+                return {"ok": False, "error": "pont qwen3asr fermé prématurément"}
+            return json.loads(line)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    try:
+        resp = _call({"cmd": "init"})
+        if not resp.get("ok"):
+            print(f"   ❌ Qwen3-ASR init échoué : {resp.get('error', '?')}"); sys.exit(1)
+        print(f"   Modèles chargés : {time.time()-t0:.1f}s [{resp.get('device')}, {resp.get('attn')}]")
+        t1 = time.time()
+        resp = _call({"cmd": "transcribe", "audio_path": audio_path, "language": source_lang})
+        if not resp.get("ok"):
+            print(f"   ❌ Qwen3-ASR : {resp.get('error', '?')}"); sys.exit(1)
+        print(f"   Transcription + alignement : {time.time()-t1:.1f}s")
+        _call({"cmd": "quit"})
+    finally:
+        try:
+            proc.stdin.close(); proc.wait(timeout=30)
+        except Exception:
+            proc.kill()
+
+    detected = resp.get("language") or ""
+    if detected and detected != source_lang:
+        print(f"   ⚠️  Langue détectée « {detected} » ≠ langue source demandée « {source_lang} »")
+    segments = [
+        DubSegment(index=i+1, start=s["start"], end=s["end"],
+                   text=s["text"].strip(), words=s.get("words", []))
+        for i, s in enumerate(resp.get("segments", []))
+    ]
+    dur = segments[-1].end if segments else 0
+    print(f"   ✅ {len(segments)} segments ({dur/60:.1f} min)")
+    return segments
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PASSE 2 : DIARISATION (IDENTIFICATION DES LOCUTEURS)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -908,6 +1046,10 @@ def diarize_speakers(audio_path: str, segments: list[DubSegment],
         return segments
 
     t0 = time.time()
+    # En reprise (--segments) la transcription est sautée, et sa purge avec :
+    # le LLM local laissé résident par le script précédent fait OOM pyannote.
+    acquire_gpu_lock()
+    free_gpu_for_task(min_free_mib=6000, timeout=60)
     from whisperx.diarize import DiarizationPipeline
     diarize_model = DiarizationPipeline(
         token=hf_token, device=device
@@ -991,7 +1133,7 @@ def diarize_speakers(audio_path: str, segments: list[DubSegment],
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PASSE 3 : SÉPARATION DE SOURCES (DEMUCS)
+# PASSE 3 : SÉPARATION DE SOURCES (DEMUCS, OU MELBAND-ROFORMER AVEC --separator roformer)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Seuil au-delà duquel on découpe en chunks (en secondes).
@@ -1065,6 +1207,74 @@ def _run_demucs_single(audio_path: str, out_dir: str) -> tuple[str, str]:
     return vocals, no_vocals
 
 
+# ── Moteur « roformer » : MelBand-RoFormer via audio-separator ─────────────────
+# Modèle « MelBand Roformer | Vocals by Kimberley Jensen »
+# (vocals_mel_band_roformer.ckpt, licence MIT, 913 Mo) : SDR vocals 12,6 dB
+# annoncé par le catalogue d'audio-separator (`audio-separator --list_models`),
+# le meilleur « vocals » sous licence libre du catalogue (Kim FT by unwa 12,4 ;
+# BS-Roformer-Viperx-1296 12,1 ; htdemucs ≈ 8,6 sur le même banc MVSEP).
+# Tourne dans l'env conda `audio-separator` via son CLI, comme Qwen3-TTS dans le
+# sien. Mesuré le 2026-11-02 sur un média synthétique (essais-asr/RESULTATS.md).
+ROFORMER_MODEL = "vocals_mel_band_roformer.ckpt"
+# Pas le /tmp par défaut du CLI (effacé au redémarrage → 913 Mo retéléchargés).
+ROFORMER_MODEL_DIR = os.path.expanduser("~/.cache/audio-separator-models")
+
+
+def _get_audio_separator_bin() -> str:
+    """Retourne le CLI audio-separator de l'env conda 'audio-separator', ou '' si introuvable."""
+    for base in [os.path.expanduser("~/miniconda3"), os.path.expanduser("~/anaconda3"),
+                 "/opt/conda", os.path.expanduser("~/miniforge3")]:
+        exe = os.path.join(base, "envs", "audio-separator", "bin", "audio-separator")
+        if os.path.isfile(exe):
+            return exe
+    try:
+        r = subprocess.run(["conda", "info", "--envs"], capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            if "audio-separator" in line and "/envs/" in line:
+                exe = os.path.join(line.split()[-1].strip(), "bin", "audio-separator")
+                if os.path.isfile(exe):
+                    return exe
+    except Exception:
+        pass
+    return ""
+
+
+def _run_roformer_single(audio_path: str, out_dir: str) -> tuple[str, str]:
+    """Lance audio-separator (MelBand-RoFormer) sur un fichier audio et retourne
+    (vocals, no_vocals), écrits dans <out_dir>/roformer/ — le pendant du
+    <out_dir>/htdemucs/ de Demucs : mêmes noms de fichiers, même 44,1 kHz stéréo.
+    Le checkpoint est téléchargé au premier appel dans ROFORMER_MODEL_DIR, puis
+    réutilisé (le CLI vérifie la présence du fichier, pas de retéléchargement)."""
+    exe = _get_audio_separator_bin()
+    if not exe:
+        print("   ❌ audio-separator introuvable → conda create -n audio-separator python=3.10 && "
+              "conda run -n audio-separator pip install -U 'audio-separator[gpu]'")
+        return "", ""
+    model_dir = os.path.join(out_dir, "roformer")
+    os.makedirs(model_dir, exist_ok=True)
+    cmd = [
+        exe, "-m", ROFORMER_MODEL,
+        "--model_file_dir", ROFORMER_MODEL_DIR,
+        "--output_dir", model_dir,
+        "--output_format", "WAV",
+        # 1.0 = ne touche au niveau que pour éviter l'écrêtage (le défaut 0.9
+        # baisserait les pistes et changerait le niveau du fond sous le doublage).
+        "--normalization", "1.0",
+        "--custom_output_names", json.dumps({"Vocals": "vocals", "Other": "no_vocals"}),
+        audio_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"   ❌ audio-separator erreur :\n{(r.stderr or r.stdout)[-600:]}")
+        return "", ""
+    vocals = os.path.join(model_dir, "vocals.wav")
+    no_vocals = os.path.join(model_dir, "no_vocals.wav")
+    if not (os.path.exists(vocals) and os.path.exists(no_vocals)):
+        print(f"   ❌ pistes introuvables dans {model_dir} : {os.listdir(model_dir)}")
+        return "", ""
+    return vocals, no_vocals
+
+
 def _crossfade_concat(chunk_paths: list[str], overlap_sec: float,
                       output_path: str, sample_rate: int) -> str:
     """
@@ -1121,14 +1331,18 @@ def _crossfade_concat(chunk_paths: list[str], overlap_sec: float,
     return output_path
 
 
-def separate_sources(audio_hq_path: str, work_dir: str) -> tuple[str, str]:
+def separate_sources(audio_hq_path: str, work_dir: str,
+                     separator: str = "demucs") -> tuple[str, str]:
     """
-    Sépare voix et fond sonore avec Demucs (Meta).
+    Sépare voix et fond sonore avec Demucs (Meta), ou avec MelBand-RoFormer
+    (`separator="roformer"`, voir _run_roformer_single).
     Pour les audios > 20 min, découpe en chunks avec crossfade
-    pour éviter les dépassements de RAM.
+    pour éviter les dépassements de RAM (les deux moteurs).
     Retourne (vocals_path, background_path).
     """
-    print(f"\n🎛️  Passe 3 — Séparation de sources (Demucs)...")
+    moteur = "MelBand-RoFormer" if separator == "roformer" else "Demucs"
+    _run_single = _run_roformer_single if separator == "roformer" else _run_demucs_single
+    print(f"\n🎛️  Passe 3 — Séparation de sources ({moteur})...")
     t0 = time.time()
 
     duration = _get_audio_duration(audio_hq_path)
@@ -1140,12 +1354,14 @@ def separate_sources(audio_hq_path: str, work_dir: str) -> tuple[str, str]:
     # Résultats finaux
     final_vocals = os.path.join(out_dir, "vocals.wav")
     final_no_vocals = os.path.join(out_dir, "no_vocals.wav")
-    # Un fichier court (traitement direct) laisse ses pistes dans htdemucs/ :
-    # sans ce second regard, chaque reprise (--segments) refaisait Demucs sur
-    # le GPU, hors verrou — et plantait si un LLM local l'occupait (2026-10-13).
+    # Un fichier court (traitement direct) laisse ses pistes dans htdemucs/
+    # (ou roformer/) : sans ce second regard, chaque reprise (--segments)
+    # refaisait Demucs sur le GPU, hors verrou — et plantait si un LLM local
+    # l'occupait (2026-10-13).
     if not os.path.exists(final_vocals):
-        sub_vocals = os.path.join(out_dir, "htdemucs", "vocals.wav")
-        sub_no_vocals = os.path.join(out_dir, "htdemucs", "no_vocals.wav")
+        sous_dossier = "roformer" if separator == "roformer" else "htdemucs"
+        sub_vocals = os.path.join(out_dir, sous_dossier, "vocals.wav")
+        sub_no_vocals = os.path.join(out_dir, sous_dossier, "no_vocals.wav")
         if os.path.exists(sub_vocals) and os.path.exists(sub_no_vocals):
             final_vocals, final_no_vocals = sub_vocals, sub_no_vocals
 
@@ -1161,9 +1377,9 @@ def separate_sources(audio_hq_path: str, work_dir: str) -> tuple[str, str]:
     if duration <= DEMUCS_CHUNK_DURATION + 60:  # marge de 1 min
         print(f"   📏 Durée : {duration_min:.1f} min → traitement direct")
 
-        vocals, no_vocals = _run_demucs_single(audio_hq_path, out_dir)
+        vocals, no_vocals = _run_single(audio_hq_path, out_dir)
         if not vocals or not os.path.exists(vocals):
-            print(f"   ❌ Fichiers Demucs introuvables dans {out_dir}")
+            print(f"   ❌ Fichiers {moteur} introuvables dans {out_dir}")
             sys.exit(1)
 
         mv = os.path.getsize(vocals) / (1024*1024)
@@ -1199,10 +1415,10 @@ def separate_sources(audio_hq_path: str, work_dir: str) -> tuple[str, str]:
         # Découper
         _split_audio_chunk(audio_hq_path, chunk_start, chunk_dur, chunk_audio)
 
-        # Demucs sur le chunk
-        v, bg = _run_demucs_single(chunk_audio, chunk_out)
+        # Séparation du chunk
+        v, bg = _run_single(chunk_audio, chunk_out)
         if not v or not os.path.exists(v):
-            print(f"   ❌ Demucs a échoué sur le chunk {ci+1}")
+            print(f"   ❌ {moteur} a échoué sur le chunk {ci+1}")
             sys.exit(1)
 
         vocal_chunks.append(v)
@@ -5737,6 +5953,53 @@ def finaliser_le_son(video: str):
         print("   ⚠️  La finition du son a échoué : la vidéo est laissée telle quelle")
 
 
+def lipsync_video(video: str, audio: str) -> bool:
+    """Option --lipsync : LatentSync 1.6 redessine la bouche du locuteur pour
+    qu'elle suive la piste doublée. La vidéo garde son nom ; le résultat
+    remplace la vidéo assemblée seulement si LatentSync a réussi.
+
+    Coût réel (RTX 3090) : ~18 Go de VRAM, environ 16 s de calcul par seconde
+    de vidéo à 25 i/s (1080×1920) — à réserver aux vidéos courtes, avec un
+    seul visage bien visible. La vidéo est ré-encodée (H.264, 25 i/s).
+    """
+    if not os.path.exists(video):
+        return False
+    py = _get_latentsync_python()
+    unet = os.path.join(LATENTSYNC_DIR, "checkpoints", "latentsync_unet.pt")
+    if not py or not os.path.isfile(os.path.join(LATENTSYNC_DIR, "scripts", "inference.py")) \
+            or not os.path.exists(unet):
+        print("   ⚠️  LatentSync introuvable (env conda `latentsync`, dépôt et checkpoints "
+              f"attendus dans {LATENTSYNC_DIR}) : lèvres non synchronisées")
+        return False
+    print(f"\n👄 Synchronisation labiale (LatentSync 1.6) : {os.path.basename(video)}", flush=True)
+    t0 = time.time()
+    tmp_out = video[:-4] + "_lipsync.mp4" if video.lower().endswith(".mp4") else video + ".lipsync.mp4"
+    free_gpu_for_task(min_free_mib=19000, timeout=120)   # ~18 Go : rien d'autre ne doit tourner
+    acquire_gpu_lock()
+    env = dict(os.environ, PYTHONNOUSERSITE="1", HF_HUB_OFFLINE="1")
+    cmd = [py, "-m", "scripts.inference",
+           "--unet_config_path", "configs/unet/stage2_512.yaml",
+           "--inference_ckpt_path", "checkpoints/latentsync_unet.pt",
+           "--inference_steps", str(LATENTSYNC_STEPS),
+           "--guidance_scale", str(LATENTSYNC_GUIDANCE),
+           "--enable_deepcache",
+           "--seed", str(LATENTSYNC_SEED),
+           "--video_path", os.path.abspath(video),
+           "--audio_path", os.path.abspath(audio),
+           "--video_out_path", os.path.abspath(tmp_out)]
+    r = subprocess.run(cmd, cwd=LATENTSYNC_DIR, env=env, capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(tmp_out) or os.path.getsize(tmp_out) < 10_000:
+        print(f"   ⚠️  LatentSync a échoué : la vidéo est laissée telle quelle\n"
+              f"      {r.stderr.strip().splitlines()[-1][:300] if r.stderr.strip() else ''}")
+        if os.path.exists(tmp_out):
+            os.remove(tmp_out)
+        return False
+    os.replace(tmp_out, video)
+    mb = os.path.getsize(video) / (1024*1024)
+    print(f"   ✅ {video} ({mb:.1f} Mo) [{time.time()-t0:.0f}s]")
+    return True
+
+
 def assemble_video(video_path: str, mixed_audio_path: str,
                    output_path: str, watermark: bool = True,
                    skip_seconds: float = 0.0) -> str:
@@ -6341,6 +6604,10 @@ def main():
                    help="Utiliser un fichier SRT traduit professionnellement comme base. "
                         "Les sous-titres sont alignés par timecode sur les segments WhisperX, "
                         "les passes de revue Claude (4c–4e) sont sautées.")
+    p.add_argument("--separator", choices=["demucs", "roformer"], default="demucs",
+                   help="Moteur de séparation voix/fond (défaut: demucs). "
+                        "roformer = MelBand-RoFormer via audio-separator (env conda "
+                        "audio-separator) : fond plus propre sous la voix-off, plus lent.")
     p.add_argument("--tts", choices=["qwen3tts", "elevenlabs"],
                    default="qwen3tts",
                    help="Backend TTS (défaut: qwen3tts)")
@@ -6407,6 +6674,9 @@ def main():
     p.add_argument("--finaliser", action="store_true",
                    help="Finaliser le son de la vidéo produite (finaliser.py : "
                         "bruit de fond, volume à la norme)")
+    p.add_argument("--lipsync", action="store_true",
+                   help="Après l'assemblage, LatentSync 1.6 fait suivre les lèvres à la voix doublée "
+                        "(vidéos courtes, un visage ; ~18 Go VRAM, ~16 s de calcul par seconde de vidéo)")
     p.add_argument("--skip-video", action="store_true",
                    help="Produire uniquement l'audio mixé (pas de vidéo)")
     p.add_argument("--watermark", action="store_true",
@@ -6436,6 +6706,10 @@ def main():
     p.add_argument("--context", type=str, default="",
                    help="Contexte pour guider la traduction (noms, sujet, registre...)")
     p.add_argument("--whisper-model", default=WHISPER_MODEL)
+    p.add_argument("--asr", choices=["whisperx", "qwen3"], default="whisperx",
+                   help="Moteur de transcription (défaut: whisperx). qwen3 = Qwen3-ASR-1.7B "
+                        "+ Qwen3-ForcedAligner (env conda qwen3asr), mêmes segments et mots "
+                        "horodatés ; en essai (essais-asr/RESULTATS.md).")
     p.add_argument("--claude-model", default=CLAUDE_MODEL)
     p.add_argument("--llm", choices=["claude", "local"], default="local",
                    help="Backend LLM : local (Ollama, défaut) ou claude (API Anthropic)")
@@ -6560,7 +6834,8 @@ def main():
     print(f"   TTS      : {tts_label}")
     print(f"   Sortie   : {output}")
     llm_label = f"Ollama {args.ollama_model}" if args.llm == "local" else f"Claude {CLAUDE_MODEL}"
-    print(f"   Whisper  : {WHISPER_MODEL} | LLM : {llm_label}")
+    asr_label = "Qwen3-ASR-1.7B + ForcedAligner" if args.asr == "qwen3" else f"WhisperX {WHISPER_MODEL}"
+    print(f"   ASR      : {asr_label} | LLM : {llm_label}")
     if args.speakers:
         print(f"   Locuteurs: {args.speakers} (forcé)")
     if args.keep_original > 0 and args.no_voiceover:
@@ -6588,7 +6863,7 @@ def main():
     if args.skip_checks:
         print("   ⏩ Vérification des dépendances sautée (--skip-checks)")
     else:
-        check_dependencies(args.tts)
+        check_dependencies(args.tts, separator=args.separator, asr=args.asr)
 
     t_global = time.time()
 
@@ -6629,7 +6904,10 @@ def main():
               (f" ({sum(1 for s in segments if s.text_tgt)} traduits)" if has_translations else ""))
     else:
         extract_audio(args.video, audio_16k, skip_seconds)
-        segments = transcribe_whisperx(audio_16k, src_lang, args.hf_token)
+        if args.asr == "qwen3":
+            segments = transcribe_qwen3(audio_16k, src_lang, args.hf_token)
+        else:
+            segments = transcribe_whisperx(audio_16k, src_lang, args.hf_token)
         save_segments(segments, seg_json)
 
     # ── Relecture Epoch Times (correction noms propres) ─────────────────────
@@ -6655,7 +6933,11 @@ def main():
 
     # ── PASSE 1b + 3 : Audio HQ + Demucs ────────────────────────────────────
     extract_audio_hq(args.video, audio_hq, skip_seconds)
-    vocals_path, bg_path = separate_sources(audio_hq, work_dir)
+    # Première étape GPU quand --segments saute la transcription : sans purge,
+    # le séparateur partage la carte avec un modèle Ollama encore résident.
+    acquire_gpu_lock()
+    free_gpu_for_task(min_free_mib=6000, timeout=60)
+    vocals_path, bg_path = separate_sources(audio_hq, work_dir, separator=args.separator)
 
     if args.remove_music:
         import soundfile as sf
@@ -6993,6 +7275,13 @@ def main():
                            watermark=args.watermark,
                            skip_seconds=skip_seconds)
 
+        lipsync_done = False
+        if args.lipsync:
+            if args.dual_audio:
+                print("\n   ⚠️  Deux pistes audio : pas de synchronisation labiale (LatentSync n'écrit qu'une piste)")
+            else:
+                lipsync_done = lipsync_video(output, mixed_audio)
+
         if args.finaliser:
             if args.dual_audio:
                 # finaliser.py ne garde qu'une piste de son
@@ -7034,7 +7323,8 @@ def main():
         print(f"   🎤 Piste doublée    : {onlydub_mp3}")
     else:
         if not args.skip_video:
-            print(f"   🎬 Vidéo doublée    : {output}")
+            lips = " (lèvres synchronisées)" if args.lipsync and lipsync_done else ""
+            print(f"   🎬 Vidéo doublée    : {output}{lips}")
         print(f"   🎚️  Audio mixé       : {mixed_audio}")
     print(f"   📝 Rapport          : {report_txt}")
     if os.path.exists(social_txt):

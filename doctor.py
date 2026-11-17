@@ -62,8 +62,10 @@ OPTIONAL_PKGS = [
 ]
 # Envs conda secondaires (bridges TTS) — facultatifs
 TTS_ENVS = ["qwen3tts"]
+# Env conda de la séparation voix/fond MelBand-RoFormer (--separator roformer) — facultatif
+SEPARATOR_ENVS = [("audio-separator", "python=3.10", "pip install -U 'audio-separator[gpu]'")]
 # Modèles Ollama recommandés (les deux retenus + le défaut résumé)
-OLLAMA_RECOMMENDED = ["qwen3.6:27b", "gemma4:31b", "mistral-small:latest"]
+OLLAMA_RECOMMENDED = ["qwen3.6:27b", "gemma4:31b", "mistral-small3.2:24b"]
 OLLAMA_URL = "http://localhost:11434"
 
 
@@ -178,6 +180,13 @@ def check_tts_envs(rep):
         else:
             rep.add(WARN, f"env {env}", "absent",
                     f"conda create -n {env} python=3.11  (requis seulement pour ce backend)")
+    for env, py, pip in SEPARATOR_ENVS:
+        if os.path.isdir(os.path.join(base, env)):
+            rep.add(OK, f"env {env}", "(--separator roformer)")
+        else:
+            rep.add(WARN, f"env {env}", "absent",
+                    f"conda create -n {env} {py} && conda run -n {env} {pip}  "
+                    f"(requis seulement pour --separator roformer)")
 
 
 def ollama_models():

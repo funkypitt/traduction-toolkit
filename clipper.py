@@ -169,6 +169,7 @@ def _fmt_ass(sec: float) -> str:
 OLLAMA_URL = "http://localhost:11434"
 OLLAMA_MODEL = "qwen3.6:27b"
 OLLAMA_NUM_PREDICT = 16384         # marge large (tokens de réflexion inclus)
+OLLAMA_NUM_CTX = 16384             # plancher de la fenêtre de contexte (agrandie au besoin)
 
 
 class _OllamaClient:
@@ -186,12 +187,17 @@ class _OllamaClient:
         if system:
             msgs.append({"role": "system", "content": system})
         msgs.extend(kwargs.get("messages", []))
+        # Sans num_ctx, Ollama ouvre 32K et un 27B déborde sur le CPU (bench 2026-10-17) ;
+        # un prompt trop long serait tronqué en silence : fenêtre = besoin réel,
+        # arrondie à 4K (≈ 3 caractères par token + 4K de réponse), plancher OLLAMA_NUM_CTX.
+        besoin = sum(len(m["content"]) for m in msgs) // 3 + 4096
+        num_ctx = max(OLLAMA_NUM_CTX, -(-besoin // 4096) * 4096)
         payload = json.dumps({
             "model": self.model,
             "messages": msgs,
             "stream": False,
             "think": False,            # désactive la réflexion (raisonneurs type qwen3.6/qwen3)
-            "options": {"num_predict": OLLAMA_NUM_PREDICT},
+            "options": {"num_predict": OLLAMA_NUM_PREDICT, "num_ctx": num_ctx},
         }).encode()
         req = urllib.request.Request(
             f"{self.base_url}/api/chat",

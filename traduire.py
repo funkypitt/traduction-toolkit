@@ -842,12 +842,83 @@ def extract_audio(video_path: str, output_path: str) -> str:
 DEMUCS_CHUNK_MINUTES = 20.0  # borne RAM Demucs : > 1h en bloc → OOM-killer (~17 Go RSS)
 
 
+# ── Moteur « roformer » : MelBand-RoFormer via audio-separator ─────────────────
+# Modèle « MelBand Roformer | Vocals by Kimberley Jensen »
+# (vocals_mel_band_roformer.ckpt, licence MIT, 913 Mo) : SDR vocals 12,6 dB
+# annoncé par le catalogue d'audio-separator (`audio-separator --list_models`),
+# le meilleur « vocals » sous licence libre du catalogue (Kim FT by unwa 12,4 ;
+# BS-Roformer-Viperx-1296 12,1 ; htdemucs ≈ 8,6 sur le même banc MVSEP).
+# Tourne dans l'env conda `audio-separator` via son CLI, comme Qwen3-TTS dans le
+# sien. Mesuré le 2026-11-02 sur un média synthétique (essais-asr/RESULTATS.md).
+ROFORMER_MODEL = "vocals_mel_band_roformer.ckpt"
+# Pas le /tmp par défaut du CLI (effacé au redémarrage → 913 Mo retéléchargés).
+ROFORMER_MODEL_DIR = os.path.expanduser("~/.cache/audio-separator-models")
+
+
+def _get_audio_separator_bin() -> str:
+    """Retourne le CLI audio-separator de l'env conda 'audio-separator', ou '' si introuvable."""
+    for base in [os.path.expanduser("~/miniconda3"), os.path.expanduser("~/anaconda3"),
+                 "/opt/conda", os.path.expanduser("~/miniforge3")]:
+        exe = os.path.join(base, "envs", "audio-separator", "bin", "audio-separator")
+        if os.path.isfile(exe):
+            return exe
+    try:
+        r = subprocess.run(["conda", "info", "--envs"], capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            if "audio-separator" in line and "/envs/" in line:
+                exe = os.path.join(line.split()[-1].strip(), "bin", "audio-separator")
+                if os.path.isfile(exe):
+                    return exe
+    except Exception:
+        pass
+    return ""
+
+
+def _run_roformer_single(audio_path: str, out_dir: str) -> tuple[str, str]:
+    """Lance audio-separator (MelBand-RoFormer) sur un fichier audio et retourne
+    (vocals, no_vocals), écrits dans <out_dir>/roformer/ — le pendant du
+    <out_dir>/htdemucs/ de Demucs : mêmes noms de fichiers, même 44,1 kHz stéréo.
+    Le checkpoint est téléchargé au premier appel dans ROFORMER_MODEL_DIR, puis
+    réutilisé (le CLI vérifie la présence du fichier, pas de retéléchargement)."""
+    exe = _get_audio_separator_bin()
+    if not exe:
+        print("   ❌ audio-separator introuvable → conda create -n audio-separator python=3.10 && "
+              "conda run -n audio-separator pip install -U 'audio-separator[gpu]'")
+        return "", ""
+    model_dir = os.path.join(out_dir, "roformer")
+    os.makedirs(model_dir, exist_ok=True)
+    cmd = [
+        exe, "-m", ROFORMER_MODEL,
+        "--model_file_dir", ROFORMER_MODEL_DIR,
+        "--output_dir", model_dir,
+        "--output_format", "WAV",
+        # 1.0 = ne touche au niveau que pour éviter l'écrêtage (le défaut 0.9
+        # baisserait les pistes et changerait le niveau du fond sous le doublage).
+        "--normalization", "1.0",
+        "--custom_output_names", json.dumps({"Vocals": "vocals", "Other": "no_vocals"}),
+        audio_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"   ❌ audio-separator erreur :\n{(r.stderr or r.stdout)[-600:]}")
+        return "", ""
+    vocals = os.path.join(model_dir, "vocals.wav")
+    no_vocals = os.path.join(model_dir, "no_vocals.wav")
+    if not (os.path.exists(vocals) and os.path.exists(no_vocals)):
+        print(f"   ❌ pistes introuvables dans {model_dir} : {os.listdir(model_dir)}")
+        return "", ""
+    return vocals, no_vocals
+
+
 def separate_vocals(audio_path: str, work_dir: str,
-                    chunk_minutes: float = DEMUCS_CHUNK_MINUTES) -> str:
+                    chunk_minutes: float = DEMUCS_CHUNK_MINUTES,
+                    separator: str = "demucs") -> str:
     """Isole la voix avec Demucs (utile pour les vidéos avec musique de fond,
-    voix-off mixées, collages sonores). Sans ça, le VAD/wav2vec2 de WhisperX
-    confond la musique vocale-like avec de la vraie parole et place les mots
-    n'importe où dans les zones musicales.
+    voix-off mixées, collages sonores), ou avec MelBand-RoFormer
+    (`separator="roformer"`, voir _run_roformer_single ; mêmes tranches, le
+    sous-dossier htdemucs/ devient roformer/). Sans ça, le VAD/wav2vec2 de
+    WhisperX confond la musique vocale-like avec de la vraie parole et place
+    les mots n'importe où dans les zones musicales.
 
     Découpe l'audio en tranches de `chunk_minutes` pour borner la RAM : un
     Demucs htdemucs sur 2h en bloc consomme > 17 Go RSS et fait tomber le
@@ -855,11 +926,13 @@ def separate_vocals(audio_path: str, work_dir: str,
     déjà extrait pour reprendre après crash.
 
     Renvoie le chemin du fichier vocals.wav, ou `audio_path` en cas d'échec."""
-    print(f"\n🎛️  Isolation de la voix (Demucs)...")
+    moteur = "MelBand-RoFormer" if separator == "roformer" else "Demucs"
+    sous_dossier = "roformer" if separator == "roformer" else "htdemucs"
+    print(f"\n🎛️  Isolation de la voix ({moteur})...")
     t0 = time.time()
     out_dir = os.path.join(work_dir, "demucs_out")
     os.makedirs(out_dir, exist_ok=True)
-    vocals_final_dir = os.path.join(out_dir, "htdemucs")
+    vocals_final_dir = os.path.join(out_dir, sous_dossier)
     vocals_final = os.path.join(vocals_final_dir, "vocals.wav")
 
     if os.path.exists(vocals_final) and os.path.getsize(vocals_final) > 0:
@@ -881,7 +954,7 @@ def separate_vocals(audio_path: str, work_dir: str,
     for i in range(n_chunks):
         chunk_in = os.path.join(chunks_dir, f"chunk_{i:03d}.wav")
         chunk_out_dir = os.path.join(chunks_dir, f"out_{i:03d}")
-        chunk_vocals = os.path.join(chunk_out_dir, "htdemucs", "vocals.wav")
+        chunk_vocals = os.path.join(chunk_out_dir, sous_dossier, "vocals.wav")
 
         if os.path.exists(chunk_vocals) and os.path.getsize(chunk_vocals) > 0:
             print(f"   ↩️  tranche {i+1}/{n_chunks} déjà extraite, skip")
@@ -903,20 +976,24 @@ def separate_vocals(audio_path: str, work_dir: str,
             demucs_input = audio_path
 
         print(f"   ▶️  tranche {i+1}/{n_chunks}...")
-        # Pas de capture_output : stream direct, évite l'accumulation des
-        # TQDM dans le buffer Python (qui empire la pression mémoire).
-        cmd = [
-            sys.executable, "-m", "demucs",
-            "--two-stems=vocals",
-            "--segment", "6",
-            "--overlap", "0.25",
-            "-o", chunk_out_dir,
-            "--filename", "{stem}.{ext}",
-            demucs_input,
-        ]
-        r = subprocess.run(cmd)
-        if r.returncode != 0:
-            print(f"   ⚠️  Demucs a échoué sur tranche {i+1} (rc={r.returncode}) — "
+        if separator == "roformer":
+            v, _no_vocals = _run_roformer_single(demucs_input, chunk_out_dir)
+            rc = 0 if v else 1
+        else:
+            # Pas de capture_output : stream direct, évite l'accumulation des
+            # TQDM dans le buffer Python (qui empire la pression mémoire).
+            cmd = [
+                sys.executable, "-m", "demucs",
+                "--two-stems=vocals",
+                "--segment", "6",
+                "--overlap", "0.25",
+                "-o", chunk_out_dir,
+                "--filename", "{stem}.{ext}",
+                demucs_input,
+            ]
+            rc = subprocess.run(cmd).returncode
+        if rc != 0:
+            print(f"   ⚠️  {moteur} a échoué sur tranche {i+1} (rc={rc}) — "
                   f"transcription sur l'audio original")
             return audio_path
 
@@ -4204,6 +4281,10 @@ def main():
                    help="Désactiver l'isolation Demucs (active par défaut). "
                         "Sans Demucs, Silero VAD sur l'audio original sert de garde-fou, "
                         "mais WhisperX peut mal détecter la langue des segments.")
+    p.add_argument("--separator", choices=["demucs", "roformer"], default="demucs",
+                   help="Moteur d'isolation de la voix (défaut: demucs). roformer = "
+                        "MelBand-RoFormer via audio-separator (env conda audio-separator), "
+                        "plus lent.")
     p.add_argument("--ocr", action="store_true",
                    help="Extraire les sous-titres incrustés par OCR pour compléter WhisperX")
     p.add_argument("--cookies", default=None,
@@ -4376,7 +4457,7 @@ def main():
         transcribe_audio = audio
         vocals_path: Optional[str] = None
         if args.demucs:
-            transcribe_audio = separate_vocals(audio, str(work_base))
+            transcribe_audio = separate_vocals(audio, str(work_base), separator=args.separator)
             if transcribe_audio != audio:
                 vocals_path = transcribe_audio
         segments = transcribe_whisperx(transcribe_audio, src_lang, args.hf_token,

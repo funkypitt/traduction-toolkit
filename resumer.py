@@ -61,13 +61,14 @@ CLAUDE_RETRY_DELAY = 10.0
 CLAUDE_RETRY_DELAY_MAX = 120.0     # plafond du backoff exponentiel
 
 # Ollama (LLM local — alternative gratuite à l'API Claude)
-# Défaut : mistral-small (14 Go) — tient ENTIÈREMENT en VRAM 24 Go (100% GPU,
-# ~53 tok/s) → 5,3× plus rapide de bout en bout que qwen3.6:27b (qui, à 25 Go
-# en exécution, déborde toujours ~12% sur le CPU → ~24 tok/s) ; qualité FR
-# équivalente (prose structurée, natif français). Bench/validation 2026-06-24.
+# Défaut : mistral-small3.2:24b (15 Go) — tient ENTIÈREMENT en VRAM 24 Go (100% GPU)
+# → bien plus rapide de bout en bout que qwen3.6:27b (qui, à 25 Go en exécution,
+# déborde ~12% sur le CPU) ; qualité FR équivalente. Bench 2026-06-24 sur
+# mistral-small:latest (Small 3, 2501, ctx 32k) ; remplacé le 2026-11-02 par
+# mistral-small3.2:24b (déjà téléchargé, cf. audit du 2026-09-17).
 # qwen3.6:27b reste accessible via --ollama-model qwen3.6:27b (raisonneur dense).
 OLLAMA_URL = "http://localhost:11434"
-OLLAMA_MODEL = "mistral-small:latest"
+OLLAMA_MODEL = "mistral-small3.2:24b"
 OLLAMA_NUM_PREDICT = 6144          # sortie ~4000 mots max (réflexion désactivée) ; tient dans num_ctx
 OLLAMA_NUM_CTX_MAX = 24576        # plafond du contexte dynamique (couvre l'analyse ~20k tokens)
 # Synthèse locale : chunks plus petits que pour Claude → moins de prefill sur

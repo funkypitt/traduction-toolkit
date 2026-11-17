@@ -45,13 +45,13 @@ ollama pull mistral-small # résumé (défaut de resumer.py)
 # Utilisation (local = défaut)
 python traduire.py video.mp4                                    # LLM local
 python traduire.py video.mp4 --llm claude                       # API Claude
-python traduire.py video.mp4 --ollama-model mistral-small:latest  # autre modèle local
+python traduire.py video.mp4 --ollama-model mistral-small3.2:24b  # autre modèle local
 ```
 
 | Tâche | Modèle local par défaut |
 |-------|-------------------------|
 | Traduction (sous-titres, doublage) | `gemma4:31b` |
-| Résumé (`resumer.py`) | `mistral-small:latest` — tient entièrement en 24 Go de VRAM, ~5× plus rapide ; `--ollama-model qwen3.6:27b` pour le raisonneur dense |
+| Résumé (`resumer.py`) | `mistral-small3.2:24b` — tient entièrement en 24 Go de VRAM, ~5× plus rapide ; `--ollama-model qwen3.6:27b` pour le raisonneur dense |
 | Sélection de clips, alignement | `qwen3.6:27b` |
 
 > GPU NVIDIA recommandé (les modèles ~27–31B tiennent sur 24 Go de VRAM). Les tâches GPU sont **sérialisées** automatiquement (verrou global `~/.cache/traduction_gpu.lock`) pour éviter toute saturation.
@@ -176,6 +176,26 @@ pip install whisperx anthropic
 # Dépendances supplémentaires pour le doublage
 pip install demucs pydub soundfile numpy praat-parselmouth pyworld
 
+# Séparation voix/fond MelBand-RoFormer (optionnel, `--separator roformer` de
+# traduire.py, doubler.py et doubler-mp3-batch.py) : env conda dédié, le modèle
+# « MelBand Roformer | Vocals by Kimberley Jensen » (913 Mo, MIT) est téléchargé
+# au premier appel dans ~/.cache/audio-separator-models/
+conda create -n audio-separator python=3.10 -y
+conda run -n audio-separator pip install -U "audio-separator[gpu]"
+
+# Synchronisation labiale LatentSync 1.6 (optionnel, `--lipsync` de doubler.py) :
+# dépôt + env conda dédié + checkpoints (≈ 7,5 Go : unet, syncnet, whisper tiny,
+# VAE stabilityai/sd-vae-ft-mse, pack insightface buffalo_l). Dossier attendu :
+# ~/LatentSync (variable LATENTSYNC_DIR pour en changer).
+git clone --depth 1 https://github.com/bytedance/LatentSync ~/LatentSync
+conda create -n latentsync python=3.10.13 -y
+conda install -n latentsync -c conda-forge ffmpeg -y
+conda run -n latentsync pip install -r ~/LatentSync/requirements.txt
+hf download ByteDance/LatentSync-1.6 latentsync_unet.pt stable_syncnet.pt whisper/tiny.pt --local-dir ~/LatentSync/checkpoints
+hf download stabilityai/sd-vae-ft-mse config.json diffusion_pytorch_model.safetensors
+# pack insightface : https://github.com/deepinsight/insightface/releases (buffalo_l.zip)
+#   → décompressé dans ~/LatentSync/checkpoints/auxiliary/models/buffalo_l/
+
 # YouTube (optionnel, pour doubler.py)
 pip install yt-dlp
 ```
@@ -265,6 +285,14 @@ python doubler.py video.mp4 -s en -t es
 
 # Doublage pur (sans voix originale en fond)
 python doubler.py video.mp4 --no-voiceover
+
+# Séparation voix/fond par MelBand-RoFormer au lieu de Demucs (fond plus propre
+# sous la voix-off ; env conda audio-separator, voir Installation manuelle)
+python doubler.py video.mp4 --separator roformer
+
+# Lèvres synchronisées sur la voix doublée (LatentSync 1.6 ; vidéos courtes,
+# un visage ; ~18 Go VRAM, ~16 s de calcul par seconde de vidéo)
+python doubler.py video.mp4 --lipsync
 
 # Forcer 2 locuteurs
 python doubler.py video.mp4 --speakers 2
@@ -409,7 +437,7 @@ La VRAM nécessaire dépend surtout du **moteur LLM** choisi (la traduction est 
 | Scénario | VRAM minimum | Cartes typiques |
 |---|---|---|
 | **LLM = Claude** (`--llm claude`) — sous-titres ou doublage | **~12 Go** | RTX 3060 12 Go / 4070 |
-| **LLM local léger** (`--ollama-model mistral-small:latest`) | **~16 Go** | RTX 4060 Ti 16 Go / 4080 |
+| **LLM local léger** (`--ollama-model mistral-small3.2:24b`) | **~16 Go** | RTX 4060 Ti 16 Go / 4080 |
 | **100 % local par défaut** (gemma4:31b traduction, qwen3.6:27b résumé) | **24 Go** | RTX 3090 / 4090 |
 
 En mode **Claude**, le pic GPU vient de **WhisperX large-v3** (~10 Go) ; le doublage ajoute Demucs, la diarisation et le TTS (chacun plus modeste, mais plus de temps de calcul). En mode **local**, le pic vient du **modèle Ollama** (~20 Go mesurés pour un 27-31B).
@@ -418,7 +446,7 @@ En mode **Claude**, le pic GPU vient de **WhisperX large-v3** (~10 Go) ; le doub
 - **Disque** : ~10 Go (WhisperX large-v3 + Qwen3-TTS, téléchargés au 1er lancement) **+ ~36 Go** si vous installez les modèles Ollama locaux par défaut (gemma4 + qwen3.6).
 - **Sans GPU** : techniquement possible mais **très lent** — déconseillé au-delà de quelques minutes de vidéo.
 
-> 💡 Carte ≤ 16 Go : gardez le local avec un modèle plus léger (`--ollama-model mistral-small:latest`), ou passez le LLM sur **Claude** (`--llm claude`). En cas d'OOM sur WhisperX, réduisez `WHISPER_BATCH_SIZE` (voir [Dépannage](#dépannage)).
+> 💡 Carte ≤ 16 Go : gardez le local avec un modèle plus léger (`--ollama-model mistral-small3.2:24b`), ou passez le LLM sur **Claude** (`--llm claude`). En cas d'OOM sur WhisperX, réduisez `WHISPER_BATCH_SIZE` (voir [Dépannage](#dépannage)).
 
 ## Fichiers produits
 
@@ -434,7 +462,7 @@ video_dubbing_work/                # dossier de travail (segments, audio interm�
   ├── segments.json                # segments (checkpoint, réutilisable avec --segments)
   ├── analysis.json                # analyse Claude
   ├── audio_hq.wav                 # audio extrait
-  ├── vocals.wav / no_vocals.wav   # séparation Demucs
+  ├── vocals.wav / no_vocals.wav   # séparation Demucs (htdemucs/) ou MelBand-RoFormer (roformer/)
   ├── mixed_audio.wav              # audio mixé final
   └── tts_*.wav                    # clips TTS individuels
 ```
