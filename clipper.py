@@ -38,6 +38,7 @@ from typing import Optional
 
 import epochtimes
 import apollohealth
+import claude_code
 
 # ── Répertoires structurés ────────────────────────────────────────────────
 SCRIPT_DIR   = Path(os.path.abspath(__file__)).parent
@@ -225,6 +226,8 @@ def _claude_create(client, **kwargs):
                                 if b.type not in ("thinking", "redacted_thinking")]
             return resp
         except Exception as exc:
+            if isinstance(client, claude_code.ClaudeCodeClient):
+                raise                   # Claude Code fait ses propres retries
             retryable = False
             if is_local:
                 retryable = True        # Ollama : retry sur toute erreur réseau/timeout
@@ -453,7 +456,7 @@ def transcribe_whisperx(audio_path: str, source_lang: Optional[str] = None,
 
     t0 = time.time()
     model = whisperx.load_model(WHISPER_MODEL, device,
-                                compute_type=WHISPER_COMPUTE_TYPE,
+                                compute_type=WHISPER_COMPUTE_TYPE if device == "cuda" else "int8",
                                 language=source_lang)
     audio = whisperx.load_audio(audio_path)
     result = model.transcribe(audio, batch_size=WHISPER_BATCH_SIZE,
@@ -1736,8 +1739,13 @@ def main():
                    help="URL source (YouTube, etc.) à inclure dans le post social")
     p.add_argument("--whisper-model", default=WHISPER_MODEL)
     p.add_argument("--claude-model", default=CLAUDE_MODEL)
-    p.add_argument("--llm", choices=["claude", "local"], default="local",
-                   help="Backend LLM : local (Ollama, défaut) ou claude (API Anthropic)")
+    p.add_argument("--llm", choices=["claude", "claude-code", "local"],
+                   default=claude_code.default_llm("local"),
+                   help="Backend LLM : local (Ollama, défaut), claude (API Anthropic) ou "
+                        "claude-code (`claude -p`, abonnement Claude, sans clé API). "
+                        "Défaut modifiable par la variable TRADUCTION_LLM")
+    p.add_argument("--cc-model", default=claude_code.DEFAULT_MODEL,
+                   help="Modèle pour --llm claude-code (alias ou ID, défaut: opus)")
     p.add_argument("--ollama-model", default=OLLAMA_MODEL,
                    help=f"Modèle Ollama (défaut: {OLLAMA_MODEL})")
     p.add_argument("--ollama-url", default=OLLAMA_URL,
@@ -1824,6 +1832,9 @@ def main():
     if args.llm == "local":
         client = _OllamaClient(args.ollama_url, args.ollama_model)
         print(f"   🧠 LLM local : Ollama {args.ollama_model}")
+    elif args.llm == "claude-code":
+        client = claude_code.ClaudeCodeClient(model=args.cc_model)
+        print(f"   🧠 LLM : Claude Code ({args.cc_model}, abonnement)")
     else:
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:

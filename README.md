@@ -63,18 +63,30 @@ Le LLM joue trois rôles : **analyse** (résumé, glossaire, noms propres, domai
 L'option `--analysis-llm` permet d'utiliser **Claude uniquement pour l'analyse**, tout en gardant la **traduction (massive) en local** :
 
 ```bash
-python traduire.py video.mp4                          # défaut : analyse via Claude SI clé dispo, sinon local
-python traduire.py video.mp4 --analysis-llm claude    # forcer Claude pour l'analyse
+python traduire.py video.mp4                          # défaut : analyse via Claude (abonnement, sinon clé API), sinon local
+python traduire.py video.mp4 --analysis-llm claude    # forcer Claude par l'API pour l'analyse
 python traduire.py video.mp4 --analysis-llm local     # tout en local, zéro appel API
 ```
 
 | Valeur | Comportement |
 |--------|--------------|
-| `auto` (défaut) | Claude si `ANTHROPIC_API_KEY` est défini, sinon **local** (aucune config requise) |
-| `claude` | force Claude pour l'analyse |
+| `auto` (défaut) | Claude par votre abonnement si Claude Code est installé, sinon par l'API si `ANTHROPIC_API_KEY` est défini, sinon **local** (aucune config requise) |
+| `claude` | force Claude par l'API pour l'analyse |
+| `claude-code` | Claude par votre abonnement (voir ci-dessous), sans clé API |
 | `local` | tout en local, aucun appel API |
 
 > 💰 **Coût** : l'analyse est **un seul appel** Claude (quelques centimes, même sur une vidéo d'une heure) ; la traduction reste **locale et gratuite**. Libre à vous de l'activer (`auto`/`claude`) ou de rester 100 % local (`local`).
+
+### Claude sans clé API : `--llm claude-code`
+
+Si [Claude Code](https://claude.com/claude-code) est installé et connecté à votre abonnement Claude, `--llm claude-code` fait passer l'analyse, la traduction et la relecture par lui (`claude -p`), sans clé API ni crédits API :
+
+```bash
+python traduire.py video.mp4 --llm claude-code              # modèle : opus
+python traduire.py video.mp4 --llm claude-code --cc-model sonnet
+```
+
+Pour en faire le moteur par défaut de tous les scripts (ligne de commande, panneau de contrôle, extension), écrivez ce seul mot dans un fichier : `mkdir -p ~/.config/traduction && echo claude-code > ~/.config/traduction/llm` (ou `export TRADUCTION_LLM=claude-code`). Supprimez le fichier pour revenir au modèle local.
 
 ## Clés API (optionnelles)
 

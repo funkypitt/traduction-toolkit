@@ -74,6 +74,7 @@ from typing import Optional
 
 import epochtimes
 import apollohealth
+import claude_code
 
 # ── Répertoires structurés ────────────────────────────────────────────────
 SCRIPT_DIR   = Path(os.path.abspath(__file__)).parent
@@ -303,6 +304,8 @@ def _claude_create(client, **kwargs):
                                 if b.type not in ("thinking", "redacted_thinking")]
             return resp
         except Exception as exc:
+            if isinstance(client, claude_code.ClaudeCodeClient):
+                raise                   # Claude Code fait ses propres retries
             retryable = False
             if is_local:
                 retryable = True        # Ollama : retry sur toute erreur réseau/timeout
@@ -624,7 +627,8 @@ QWEN3TTS_LANG_MAP = {
 }
 
 
-def check_dependencies(tts_backend: str, separator: str = "demucs", asr: str = "whisperx"):
+def check_dependencies(tts_backend: str, separator: str = "demucs", asr: str = "whisperx",
+                       llm: str = "claude"):
     """Vérifie toutes les dépendances du pipeline."""
     print("🔍 Vérification des dépendances...")
     ok = True
@@ -680,7 +684,10 @@ def check_dependencies(tts_backend: str, separator: str = "demucs", asr: str = "
             print("   qwen3asr    : ❌  → conda create -n qwen3asr python=3.12 && "
                   "conda run -n qwen3asr pip install -U qwen-asr"); ok = False
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if llm == "claude-code":
+        if not claude_code.find_bin():
+            print("   ⚠️  binaire `claude` introuvable (--llm claude-code)"); ok = False
+    elif not os.environ.get("ANTHROPIC_API_KEY"):
         print("   ⚠️  ANTHROPIC_API_KEY non définie"); ok = False
 
     if not ok:
@@ -927,7 +934,8 @@ def transcribe_whisperx(audio_path: str, source_lang: str,
 
     t0 = time.time()
     model = whisperx.load_model(WHISPER_MODEL, device,
-                                compute_type=WHISPER_COMPUTE_TYPE, language=source_lang)
+                                compute_type=WHISPER_COMPUTE_TYPE if device == "cuda" else "int8",
+                                language=source_lang)
     audio = whisperx.load_audio(audio_path)
     result = model.transcribe(audio, batch_size=WHISPER_BATCH_SIZE, language=source_lang)
     print(f"   Transcription : {time.time()-t0:.1f}s")
@@ -6711,11 +6719,18 @@ def main():
                         "+ Qwen3-ForcedAligner (env conda qwen3asr), mêmes segments et mots "
                         "horodatés ; en essai (essais-asr/RESULTATS.md).")
     p.add_argument("--claude-model", default=CLAUDE_MODEL)
-    p.add_argument("--llm", choices=["claude", "local"], default="local",
-                   help="Backend LLM : local (Ollama, défaut) ou claude (API Anthropic)")
-    p.add_argument("--analysis-llm", choices=["auto", "claude", "local"], default="auto",
-                   help="LLM de la passe d'analyse/contexte : auto = Claude si "
-                        "ANTHROPIC_API_KEY dispo, sinon local")
+    p.add_argument("--llm", choices=["claude", "claude-code", "local"],
+                   default=claude_code.default_llm("local"),
+                   help="Backend LLM : local (Ollama, défaut), claude (API Anthropic) ou "
+                        "claude-code (`claude -p`, abonnement Claude, sans clé API). "
+                        "Défaut modifiable par la variable TRADUCTION_LLM")
+    p.add_argument("--cc-model", default=claude_code.DEFAULT_MODEL,
+                   help="Modèle pour --llm claude-code (alias ou ID, défaut: opus)")
+    p.add_argument("--analysis-llm", choices=["auto", "claude", "claude-code", "local"],
+                   default="auto",
+                   help="LLM de la passe d'analyse/contexte : auto = Claude Code "
+                        "(abonnement) si `claude` est installé, sinon l'API si "
+                        "ANTHROPIC_API_KEY est là, sinon local")
     p.add_argument("--ollama-model", default=OLLAMA_MODEL,
                    help=f"Modèle Ollama (défaut: {OLLAMA_MODEL})")
     p.add_argument("--ollama-url", default=OLLAMA_URL,
@@ -6833,7 +6848,9 @@ def main():
         tts_label = "Qwen3-TTS (clonage vocal)"
     print(f"   TTS      : {tts_label}")
     print(f"   Sortie   : {output}")
-    llm_label = f"Ollama {args.ollama_model}" if args.llm == "local" else f"Claude {CLAUDE_MODEL}"
+    llm_label = (f"Ollama {args.ollama_model}" if args.llm == "local"
+                 else f"Claude Code ({args.cc_model}, abonnement)" if args.llm == "claude-code"
+                 else f"Claude {CLAUDE_MODEL}")
     asr_label = "Qwen3-ASR-1.7B + ForcedAligner" if args.asr == "qwen3" else f"WhisperX {WHISPER_MODEL}"
     print(f"   ASR      : {asr_label} | LLM : {llm_label}")
     if args.speakers:
@@ -6863,13 +6880,15 @@ def main():
     if args.skip_checks:
         print("   ⏩ Vérification des dépendances sautée (--skip-checks)")
     else:
-        check_dependencies(args.tts, separator=args.separator, asr=args.asr)
+        check_dependencies(args.tts, separator=args.separator, asr=args.asr, llm=args.llm)
 
     t_global = time.time()
 
     # ── API clients ──────────────────────────────────────────────────────────
     if args.llm == "local":
         claude = _OllamaClient(args.ollama_url, args.ollama_model)
+    elif args.llm == "claude-code":
+        claude = claude_code.ClaudeCodeClient(model=args.cc_model)
     else:
         import anthropic
         claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -6878,7 +6897,13 @@ def main():
     # domaine, glossaire) → meilleur contexte ET meilleure traduction. Un seul
     # appel, peu coûteux. "auto" = Claude si une clé est dispo.
     analysis_client = claude
-    if args.analysis_llm != "local":
+    _cc_analysis = claude_code.analysis_client(args.llm, args.analysis_llm, claude, args.cc_model)
+    if _cc_analysis is not None:
+        # « auto » : l'abonnement (Claude Code) passe avant l'API payante.
+        analysis_client = _cc_analysis
+        if _cc_analysis is not claude:
+            print("   🧠 Analyse du contexte via Claude Code (abonnement)")
+    elif args.analysis_llm != "local":
         _want_claude = args.analysis_llm == "claude" or (
             args.analysis_llm == "auto" and os.environ.get("ANTHROPIC_API_KEY"))
         if _want_claude:

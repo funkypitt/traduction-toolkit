@@ -109,18 +109,23 @@ def _llm(label="Texte confié à", claude="--claude-model", url=True, analyse=Fa
     """Bloc commun : moteur de texte, modèle local, puis réglages avancés."""
     champs = [
         C("llm", "--llm", label, "select",
-          names={"local": "un modèle local (Ollama)", "claude": "Claude (clé API)"}),
+          names={"local": "un modèle local (Ollama)", "claude": "Claude (clé API)",
+                 "claude-code": "Claude (abonnement, sans clé)"}),
         C("ollama_model", "--ollama-model", "Modèle local", "ollama",
           depends={"llm": "local"}),
     ]
     if analyse:
         champs.append(C("analysis_llm", "--analysis-llm", "Analyse préalable confiée à",
                         "select", adv=True,
-                        names={"auto": "Claude si la clé est là, sinon local",
-                               "claude": "Claude", "local": "un modèle local"}))
+                        names={"auto": "Claude (abonnement, sinon clé API), sinon local",
+                               "claude": "Claude (clé API)",
+                               "claude-code": "Claude (abonnement, sans clé)",
+                               "local": "un modèle local"}))
     if claude:
         champs.append(C("claude_model", claude, "Modèle Claude", adv=True,
                         depends={"llm": "claude"}))
+    champs.append(C("cc_model", "--cc-model", "Modèle Claude (abonnement)", adv=True,
+                    depends={"llm": "claude-code"}))
     if url:
         champs.append(C("ollama_url", "--ollama-url", "Adresse d'Ollama", adv=True,
                         depends={"llm": "local"}))
@@ -453,11 +458,22 @@ INCONNU = object()
 _MODULES = {}       # chemin → (mtime, constantes, options)
 
 
+def _llm_par_defaut(repli="local"):
+    """Le moteur de texte que les scripts prennent sans --llm sur cette machine."""
+    try:
+        import claude_code
+        return claude_code.default_llm(repli)
+    except (ImportError, SystemExit):       # réglage invalide : le script le dira
+        return repli
+
+
 def _module(fichier):
     """(constantes de module, options argparse) d'un script, relus s'il change."""
     chemin = fichier if os.path.isabs(fichier) else os.path.join(SCRIPT_DIR, fichier)
     try:
-        mtime = os.stat(chemin).st_mtime
+        # Le réglage du moteur par défaut fait partie de la clé : s'il change, les
+        # défauts lus ici changent aussi, et un défaut périmé ferait taire --llm.
+        mtime = (os.stat(chemin).st_mtime, _llm_par_defaut())
     except OSError:
         return {}, {}
     cache = _MODULES.get(chemin)
@@ -542,6 +558,12 @@ def _valeur(n, consts, profondeur=0):
         return "".join(morceaux)
     if isinstance(n, ast.Call):
         f = n.func
+        if isinstance(f, ast.Attribute) and f.attr == "default_llm" and len(n.args) == 1:
+            # default=claude_code.default_llm("local") : le défaut suit le réglage de
+            # la machine (TRADUCTION_LLM, ~/.config/traduction/llm), ici comme dans
+            # le script qu'on lancera.
+            repli = suite(n.args[0])
+            return _llm_par_defaut(repli) if isinstance(repli, str) else INCONNU
         if isinstance(f, ast.Name) and f.id in ("list", "sorted", "tuple") and len(n.args) == 1:
             v = suite(n.args[0])
             return list(v) if isinstance(v, (list, dict)) else INCONNU
@@ -1571,8 +1593,8 @@ def main():
         hints.append("ffmpeg introuvable (incrustation/audio HS)")
     if not os.path.exists(PYTHON_BIN):
         hints.append(f"interpréteur interview absent ({PYTHON_BIN})")
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        hints.append("ANTHROPIC_API_KEY absente (mets --llm local, ou configure la clé)")
+    if not os.environ.get("ANTHROPIC_API_KEY") and _llm_par_defaut() != "claude-code":
+        hints.append("ANTHROPIC_API_KEY absente (mets --llm local ou claude-code, ou configure la clé)")
     if hints:
         print("-" * 60)
         for h in hints:
