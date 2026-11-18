@@ -301,7 +301,7 @@ else
 fi
 
 if command -v yt-dlp &>/dev/null; then
-    ok "yt-dlp        (téléchargement YouTube)"
+    ok "yt-dlp        (secours ; les scripts tiennent leur propre copie à jour, ytdlp_auto.py)"
 else
     warn "yt-dlp manquant"
     ALL_OK=false

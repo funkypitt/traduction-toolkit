@@ -486,6 +486,6 @@ video_dubbing_work/                # dossier de travail (segments, audio interm�
 | `CUDA out of memory` | Réduire `WHISPER_BATCH_SIZE` en haut du script (8 au lieu de 16) |
 | Diarisation échoue | Vérifier que `HF_TOKEN` est défini et que les modèles Pyannote sont acceptés sur HuggingFace |
 | `ffmpeg: subtitle filter not found` | Réinstaller ffmpeg avec libass : `sudo apt install ffmpeg libavcodec-extra` |
-| `yt-dlp` ne fonctionne pas | Mettre à jour : `pip install -U yt-dlp` |
+| `yt-dlp` ne fonctionne pas | Les scripts tiennent leur propre copie à jour (`ytdlp_auto.py`, une fois par jour au plus) ; pour forcer : `python ytdlp_auto.py -U` |
 | Premier lancement très long | Normal — les modèles WhisperX (~5 Go) et Qwen3-TTS se téléchargent |
 | Traitement interrompu | Utiliser `--resume segments.json` (traduire.py) ou `--segments segments.json` (doublage) |

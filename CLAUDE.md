@@ -110,6 +110,7 @@ python lire.py URL --sans-verification   # sauter la passe 5 (plus rapide, sans 
 - **`HF_TOKEN`** (required for dubbing scripts — Pyannote speaker diarization)
 - **`~/.antithese_cookies.json`** (required by `lire.py` — browser cookie export for the paywall; the `wordpress_logged_in_*` cookie expires, re-export when articles come back truncated). Password fallback via `~/.antithese.json` or `ANTITHESE_USER`/`ANTITHESE_PASS`.
 - **`ffmpeg`** system binary
+- **yt-dlp**: never the system's. `ytdlp_auto.py` (`from ytdlp_auto import ytdlp`, then `[ytdlp(), …]`) keeps one standalone copy in `~/.local/share/yt-dlp-auto/`, fetched at first use and updated by `yt-dlp -U` at most once a day before a use (house rule 2026-11-18: yt-dlp updates itself everywhere). `YTDLP=/path` pins another copy; `python ytdlp_auto.py -U` forces an update. The same file is copied in newspapers, causeries-podcast and satipanya-dharma-library, all sharing that copy.
 - GPU with CUDA recommended (WhisperX, Qwen3-TTS)
 
 ```bash

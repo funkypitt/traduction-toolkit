@@ -35,6 +35,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+from ytdlp_auto import ytdlp
 
 import claude_code
 
@@ -74,7 +75,7 @@ def fetch_playlist() -> list[dict]:
     """
     print("📋 Récupération de la playlist Antithèse...")
     cmd = [
-        "yt-dlp", "--flat-playlist",
+        ytdlp(), "--flat-playlist",
         "--print", "%(title)s\t%(url)s",
         ANTITHESE_PLAYLIST_URL,
     ]
@@ -388,7 +389,7 @@ def download_audio(url_or_path: str, output_dir: str) -> str:
     output_path = os.path.join(output_dir, "audio.wav")
 
     cmd = [
-        "yt-dlp",
+        ytdlp(),
         "--extract-audio",
         "--audio-format", "wav",
         "--audio-quality", "0",

@@ -71,6 +71,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
+from ytdlp_auto import ytdlp
 
 import epochtimes
 import apollohealth
@@ -736,12 +737,6 @@ def is_youtube_url(s: str) -> bool:
 
 def download_youtube(url: str, output_dir: str = ".") -> str:
     """Télécharge une vidéo YouTube via yt-dlp et retourne le chemin du fichier MP4."""
-    # Vérifier que yt-dlp est installé
-    if not shutil.which("yt-dlp"):
-        print("❌ yt-dlp n'est pas installé.")
-        print("   → pip install yt-dlp --break-system-packages")
-        print("   ou : sudo apt install yt-dlp")
-        sys.exit(1)
 
     print(f"\n📥 Téléchargement YouTube...")
     print(f"   URL : {url}")
@@ -749,7 +744,7 @@ def download_youtube(url: str, output_dir: str = ".") -> str:
     # Récupérer le titre pour nommer le fichier
     try:
         r = subprocess.run(
-            ["yt-dlp", "--print", "title", "--no-warnings", url],
+            [ytdlp(), "--print", "title", "--no-warnings", url],
             capture_output=True, text=True, timeout=30)
         title = r.stdout.strip() if r.returncode == 0 else ""
     except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -771,7 +766,7 @@ def download_youtube(url: str, output_dir: str = ".") -> str:
         return output_mp4
 
     cmd = [
-        "yt-dlp",
+        ytdlp(),
         "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "--merge-output-format", "mp4",
         "-o", output_template,
